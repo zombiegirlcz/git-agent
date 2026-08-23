@@ -37,7 +37,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.1"
+VERSION="1.2.2"
 PROG="git-agent"
 
 # ---------------------------------------------------------------- nastavení --
@@ -114,7 +114,38 @@ SCANNED=0 DIRTY=0 COMMITTED=0 PUSHED=0 PI_CALLED=0
 BIG_SKIPPED=() FAILED=()
 
 cleanup() { [[ -n ${_PROMPT_TMP:-} ]] && rm -f -- "$_PROMPT_TMP"; }
-trap cleanup EXIT
+
+# --- procesní hygiena -------------------------------------------------------
+# pi po skončení nechává žít děti (qmd-server, node workery…) → spouštíme ho
+# ve VLASTNÍ procesní skupině (setsid) a po běhu celou skupinu dočistíme.
+PI_PID=""
+stop_pi_group() {
+  [[ -n ${PI_PID:-} ]] || return 0
+  kill -TERM -- "-$PI_PID" 2>/dev/null || true
+  sleep "${GIT_AGENT_KILL_GRACE:-0.5}" 2>/dev/null || sleep 1
+  kill -KILL -- "-$PI_PID" 2>/dev/null || true
+  wait "$PI_PID" 2>/dev/null || true   # reap zombíků
+  PI_PID=""
+}
+on_exit() { stop_pi_group; cleanup; }
+trap on_exit EXIT
+trap 'on_exit; exit 130' INT
+trap 'on_exit; exit 143' TERM
+
+# Spustí pi (headline=$1, prompt=$2); výsledný rc uloží do _PI_RC.
+# Subshell + exec setsid ⇒ PID subshellu se stane leaderem NOVÉ skupiny,
+# kterou umíme spolehlivě zabít (i co timeout nedostal).
+spawn_pi() {
+  local headline=$1 pfile=$2 cwd=${3:-} rc
+  (
+    if [[ -n $cwd ]]; then cd -- "$cwd" || exit 99; fi
+    exec setsid timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session "$headline" < "$pfile"
+  ) &
+  PI_PID=$!
+  wait "$PI_PID"; rc=$?
+  stop_pi_group
+  _PI_RC=$rc
+}
 
 # --------------------------------------------------------------- hledání -----
 find_repos() {
@@ -201,16 +232,12 @@ EOF
   } > "$_PROMPT_TMP"
 
   local headline="[git-agent] Push selhal v $repo (branch $branch) — diagnostikuj, oprav, pushni."
-  local rc=0
   if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
     info "DRY-RUN: $PI_BIN -p --no-session \"$headline\""
+    _PI_RC=0
   else
-    (
-      cd -- "$repo" || exit 99
-      # shellcheck disable=SC2086
-      timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session "$headline" < "$_PROMPT_TMP"
-    )
-    rc=$?
+    spawn_pi "$headline" "$_PROMPT_TMP" "$repo"
+    rc=${_PI_RC:-0}
   fi
 
   if (( rc != 0 )); then
@@ -290,10 +317,16 @@ EOF
   if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
     info "DRY-RUN: $PI_BIN -p --no-session \"[git-agent] úloha…\""
     cat "$_PROMPT_TMP"
+    _PI_RC=0
   else
-    timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session \
-      "[git-agent] úloha: ${task:0:120}" < "$_PROMPT_TMP"
-    rc=$?
+    # pi potřebuje cwd = repozitář → cd uvnitř spawn wrapperu
+    (
+      exec setsid timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session \
+        "[git-agent] úloha: ${task:0:120}" < "$_PROMPT_TMP"
+    ) &
+    PI_PID=$!
+    wait "$PI_PID"; rc=$?
+    stop_pi_group
   fi
   rm -f "$_PROMPT_TMP"
 

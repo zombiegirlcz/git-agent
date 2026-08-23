@@ -191,6 +191,34 @@ unset GIT_NOTIFI
 [[ -s "$NH_LOG" ]] && { echo "-- obsah po zakázaném běhu:"; cat "$NH_LOG"; }
 chk "G: GIT_NOTIFI=0 → žádná notifikace"     test ! -s "$NH_LOG"
 
+# ------------------------------------------------ 9) procesní hygiena --------
+printf '\n== I: pi potomek je po skončení dočištěn ==\n'
+# stub pi, který si pustí dlouho žijící dítě (simulace qmd-serveru/node workerů)
+cat > "$STUB/pi-leaky" <<'EOF'
+#!/usr/bin/env bash
+echo "CALL: $*" >> "$PI_CALL_LOG"
+cat >> /dev/null
+if [[ ${STUB_LEAK:-0} == 1 ]]; then
+  ( sleep 97 ) &               # dítě ve STEJNÉ skupině jako pi (jako qmd-server)
+fi
+exit 0
+EOF
+chmod +x "$STUB/pi-leaky"
+pkill -f 'sleep 97' 2>/dev/null || true   # úklid případných starších běhů
+I="$SB/i"; mkrepo "$I/repo"
+: > "$PI_CALL_LOG"
+out=$(cd "$I/repo" && STUB_LEAK=1 GIT_AGENT_PI_BIN=pi-leaky bash "$AGENT" -pi "test úniku")
+rc=$?; saveout "$out" "$SB/i.out"
+chk     "I: exit kód 0"                    test "$rc" -eq 0
+chk     "I: leaky-pi zavoláno"             test -s "$PI_CALL_LOG"
+# po agentovi nesmí žádný `sleep 97` z jeho skupiny žít (čekáme max ~3 s na grace)
+gone=1
+for _ in 1 2 3 4 5 6; do
+  ps ax -o command 2>/dev/null | grep -qE 'sleep 97' || { gone=0; break; }
+  sleep 0.5
+done
+chk "I: potomek pi byl dočištěn (žádný sleep 97)" test "$gone" -eq 0
+
 # --------------------------------------------------- 8) -pi přímé volání -----
 printf '\n== H: -pi spustí pi okamžitě s úkolem ==\n'
 H="$SB/h"; mkrepo "$H/repo"

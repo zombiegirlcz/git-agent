@@ -59,8 +59,15 @@ HEAD se bezpečně přeskočí. Proti dvojímu běhu chrání flock.
 | `GIT_AGENT_LOG` | – | soubor pro kompletní log průběhu |
 | `GIT_NOTIFI` | `1` | notifikace přes `nh system notification` (NetHunter CLI); `0` vypne |
 | `GIT_AGENT_NH_BIN` | `nh` | binárka pro notifikace |
+| `GIT_AGENT_KILL_GRACE` | `0.5` | čekání [s] mezi SIGTERM a SIGKILL při dočišťování pi |
 | `GIT_AGENT_DRY_RUN=1` | – | nic neměnit, jen vypsat akce |
 | `GIT_AGENT_NO_COLOR=1` | – | výstup bez barev |
+
+### Procesní hygiena
+
+pi se spouští ve **vlastní procesní skupině** (`setsid`). Po skončení (nebo
+Ctrl+C/timeoutu) agent celou skupinu dočistí (SIGTERM → SIGKILL), takže po
+agentovi nezůstávají žádné zombie/qmd-server/node procesy.
 
 ## Notifikace
 
