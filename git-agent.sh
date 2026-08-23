@@ -28,10 +28,14 @@
 #   GIT_AGENT_LOG          soubor, kam se kompletní výstup přikládá (default: žádný)
 #   GIT_AGENT_NO_COLOR=1   vypne barvy
 #   GIT_AGENT_DRY_RUN=1    nic nemění, jen vypíše, co by udělal
+#
+# Notifikace (Android/NetHunter):
+#   Průběh a výsledky chodí jako systémové notifikace přes `nh system
+#   notification`. Defaultně ZAPNUTO — vypneš přes GIT_NOTIFI=0.
 
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 PROG="git-agent"
 
 # ---------------------------------------------------------------- nastavení --
@@ -41,6 +45,9 @@ PI_TIMEOUT="${GIT_AGENT_PI_TIMEOUT:-1800}"
 GLOBAL_ROOT="${GIT_AGENT_GLOBAL_ROOT:-$HOME}"
 COMMIT_TAG="git-agent"
 LOG_FILE="${GIT_AGENT_LOG:-}"
+GIT_NOTIFI="${GIT_NOTIFI:-1}"                     # notifikace přes nh: 1=zapnuto (výchozí)
+NH_BIN="${GIT_AGENT_NH_BIN:-nh}"                  # binárka NetHunter CLI
+NOTIFI_TIMEOUT="${GIT_AGENT_NOTIFY_TIMEOUT:-10}"  # timeout jedné notifikace [s]
 
 # Adresáře, do kterých se při hledání repozitářů nikdy nevstupuje.
 # (POZOR: .git sem nepatří — .git se řeší vlastním -prune -print krokem,
@@ -66,10 +73,20 @@ ok()   { printf '%s\n' "${C_GREEN}  ✓${C_OFF} $*"; }
 warn() { printf '%s\n' "${C_YEL}  !${C_OFF} $*"; }
 err()  { printf '%s\n' "${C_RED}  ✗${C_OFF} $*" >&2; }
 hdr()  { printf '\n%s%s%s\n' "$C_BOLD$C_CYAN" "$*" "$C_OFF"; }
+
+# Systémová notifikace přes NetHunter CLI (nikdy nesmí rozbít běh agenta).
+notify() {
+  [[ $GIT_NOTIFI == 1 ]] || return 0
+  command -v "$NH_BIN" >/dev/null 2>&1 || return 0
+  local title=${1:-$PROG} body=${2:-}
+  body=${body//$'\n'/ }
+  timeout "$NOTIFI_TIMEOUT" "$NH_BIN" system notification -t "$title" -c "$body" >/dev/null 2>&1 || true
+}
 die()  { printf '%s%s: %s%s\n' "$C_RED" "$PROG" "$*" "$C_OFF" >&2; exit 2; }
 
 usage() {
-  sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  # vytiskni celou úvodní komentářovou hlavičku (mezi shebang a prvním kódem)
+  awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
 }
 
 # ------------------------------------------------------------------- zámek --
@@ -194,6 +211,7 @@ EOF
   if (( rc != 0 )); then
     err "pi skončilo s chybou (rc=$rc) — repo zůstává v konfliktu"
     FAILED+=("$repo (pi rc=$rc)")
+    notify "git-agent: pi selhalo ✗" "$repo — pi skončilo chybou (rc=$rc), nutný ruční zásah"
     return 1
   fi
 
@@ -209,10 +227,12 @@ EOF
   if (( ahead == 0 )); then
     ok "pi opravilo konflikt a push proběhl"
     (( PUSHED++ ))
+    notify "git-agent: opraveno ✓" "$repo — pi vyřešilo konflikt a push proběhl"
     return 0
   fi
   err "pi nesplnilo cílový stav (ahead=$ahead) — vyžaduje ruční zásah"
   FAILED+=("$repo (po pi: ahead=$ahead)")
+  notify "git-agent: nutný zásah ✗" "$repo — pi nesplnilo push (ahead=$ahead)"
   return 1
 }
 
@@ -259,6 +279,7 @@ push_if_needed() {
 
   warn "push zamítnut / konflikt — předávám pi…"
   printf '%s\n' "$out" | sed 's/^/    /' >&2
+  notify "git-agent: konflikt ⚠" "push zamítnut v $repo (branch $branch) — řeší pi"
   pi_resolve_and_push "$repo" "$branch" "$remote" "$out"
 }
 
@@ -362,8 +383,10 @@ summary() {
   done
   if (( fails == 0 )); then
     ok "vše hotovo"
+    notify "git-agent ✓" "hotovo: $SCANNED repozitářů, $COMMITTED commitů, $PUSHED pushů"
   else
     err "celkem selhání: $fails"
+    notify "git-agent: selhání ($fails) ✗" "repo:$SCANNED commit:$COMMITTED push:$PUSHED pi:$PI_CALLED — zkontroluj log"
   fi
   (( fails > 125 )) && fails=125
   return "$fails"

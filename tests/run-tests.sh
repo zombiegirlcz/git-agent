@@ -21,9 +21,9 @@ fail() { FAILN=$((FAILN+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; }
 
 chk()     { local d=$1; shift; if "$@" >/dev/null 2>&1; then ok "$d"; else fail "$d"; fi; }
 chk_out() { local d=$1 pat=$2 file=$3
-            if grep -qiE "$pat" "$file" 2>/dev/null; then ok "$d"; else fail "$d"; fi; }
+            if grep -qiE -- "$pat" "$file" 2>/dev/null; then ok "$d"; else fail "$d"; fi; }
 chk_not_out() { local d=$1 pat=$2 file=$3
-            if grep -qiE "$pat" "$file" 2>/dev/null; then fail "$d"; else ok "$d"; fi; }
+            if grep -qiE -- "$pat" "$file" 2>/dev/null; then fail "$d"; else ok "$d"; fi; }
 
 SB=$(mktemp -d "${TMPDIR:-/tmp}/git-agent-tests-XXXXXX")
 trap 'rm -rf "$SB"' EXIT
@@ -56,7 +56,16 @@ case $cmd in
   *)       exit 0 ;;
 esac
 EOF
-chmod +x "$STUB/pi" "$STUB/git-lfs"
+# stub nh — notifikace jen zaznamenává (a nikdy nesmí spadnout, když log není nastaven)
+cat > "$STUB/nh" <<'EOF'
+#!/usr/bin/env bash
+[[ -n ${NH_LOG:-} ]] || exit 0
+if [[ ${1:-} == system && ${2:-} == notification ]]; then
+  echo "notification -t ${4:-} -c ${6:-}" >> "$NH_LOG"
+fi
+exit 0
+EOF
+chmod +x "$STUB/pi" "$STUB/git-lfs" "$STUB/nh"
 
 export GIT_AGENT_NO_COLOR=1 GIT_AGENT_PI_BIN=pi
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
@@ -103,7 +112,7 @@ fi
 
 # ------------------------------------------------------- 1) čisté repozitáře --
 printf '\n== A: čisté repozitáře ==\n'
-export PI_CALL_LOG="$SB/pi.log" PI_PROMPT_LOG="$SB/prompt.log" LFS_LOG="$SB/lfs.log"
+export PI_CALL_LOG="$SB/pi.log" PI_PROMPT_LOG="$SB/prompt.log" LFS_LOG="$SB/lfs.log" NH_LOG="$SB/nh.log"
 A="$SB/a"; mkrepo "$A/r1"; mkrepo "$A/r2"
 : > "$PI_CALL_LOG"
 out=$(run_agent "$A"); rc=$?; saveout "$out" "$SB/a.out"
@@ -163,7 +172,25 @@ unset PI_STUB_MODE
 chk     "E: nenulový exit kód"         test "$rc" -ne 0
 chk_out "E: výstup obsahuje SELHALO"   "SELHALO" "$SB/e.out"
 
-# --------------------------------------------------------------- 6) CLI -------
+# --------------------------------------------------------- 6) notifikace -----
+printf '\n== G: notifikace přes nh ==\n'
+G="$SB/g"; mkrepo "$G/repo"
+echo change > "$G/repo/seed.txt"
+: > "$NH_LOG"
+out=$(run_agent "$G"); rc=$?
+saveout "$out" "$SB/g.out"
+chk     "G: exit kód 0"                       test "$rc" -eq 0
+chk     "G: notifikace odeslána"              grep -q 'notification -t' "$NH_LOG"
+chk_out "G: shrnutí v notifikaci"             "hotovo:.*commitů" "$NH_LOG"
+chk_out "G: titulek obsahuje git-agent"       "-t .*git-agent"   "$NH_LOG"
+: > "$NH_LOG"
+export GIT_NOTIFI=0
+out=$(run_agent "$G"); rc=$?
+unset GIT_NOTIFI
+[[ -s "$NH_LOG" ]] && { echo "-- obsah po zakázaném běhu:"; cat "$NH_LOG"; }
+chk "G: GIT_NOTIFI=0 → žádná notifikace"     test ! -s "$NH_LOG"
+
+# --------------------------------------------------------------- 7) CLI -------
 printf '\n== F: CLI ==\n'
 bash "$AGENT" --help > "$SB/help.out" 2>&1
 chk "F: --help zmiňuje --add-lfs"        grep -q -- "--add-lfs" "$SB/help.out"
