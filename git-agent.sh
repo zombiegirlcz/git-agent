@@ -8,7 +8,9 @@
 #   git-agent                  Lokální režim: projde aktuální složku (rekurzivně)
 #   git-agent -g | --global    Globální režim: prohledá celý $HOME
 #                              (kořen lze změnit: GIT_AGENT_GLOBAL_ROOT=/ git-agent -g)
-#   git-agent -pi "kontext"    Doplňující kontext předaný pi při řešení konfliktu
+#   git-agent -pi "úkol"      Spustí PI OKAMŽITĚ v aktuálním repozitři — dostane
+#                             plný kontext repa + tvůj úkol (a při konfliktu
+#                             během automatického pushu ho dostane také)
 #   git-agent --add-lfs SOUBOR Přidá soubor do Git LFS ve svém repozáři a commitne
 #   git-agent -h | --help      Nápověda
 #   git-agent -V | --version   Verze
@@ -35,7 +37,7 @@
 
 set -uo pipefail
 
-VERSION="1.2.0"
+VERSION="1.2.1"
 PROG="git-agent"
 
 # ---------------------------------------------------------------- nastavení --
@@ -90,9 +92,12 @@ usage() {
 }
 
 # ------------------------------------------------------------------- zámek --
-if command -v flock >/dev/null 2>&1; then
-  exec 9>"${TMPDIR:-/tmp}/git-agent.lock"
-  flock -n 9 || die "již běží jiná instance ($PROG)."
+# Bypass: GIT_AGENT_NO_LOCK=1 (např. v izolovaných prostředích se sdíleným /tmp,
+# kde může držet neviditelný proces z jiného namespace).
+if [[ ${GIT_AGENT_NO_LOCK:-0} != 1 ]] && command -v flock >/dev/null 2>&1; then
+  LOCK_FILE="${GIT_AGENT_LOCKFILE:-${TMPDIR:-/tmp}/git-agent-${UID:-$(id -u)}.lock}"
+  exec 9>"$LOCK_FILE"
+  flock -n 9 || die "již běží jiná instance ($PROG). Vynutit: GIT_AGENT_NO_LOCK=1"
 fi
 
 if [[ -n $LOG_FILE ]]; then
@@ -234,6 +239,72 @@ EOF
   FAILED+=("$repo (po pi: ahead=$ahead)")
   notify "git-agent: nutný zásah ✗" "$repo — pi nesplnilo push (ahead=$ahead)"
   return 1
+}
+
+# ------------------------------------------------------------- pi přímé -----
+# `git-agent -pi "úkol"` — spustí pi OKAMŽITĚ v aktuálním repozitři s plným
+# kontextem repa + uživatelovým zadáním (bez čekání na konflikt).
+run_pi_direct() {
+  local task=$1
+  [[ -n $task ]] || die "-pi vyžaduje úkol jako argument"
+  local repo
+  repo=$(git rev-parse --show-toplevel 2>/dev/null) \
+    || die "-pi: nejsi uvnitř git repozitáře ($PWD)"
+  command -v "$PI_BIN" >/dev/null 2>&1 \
+    || die "pi nenalezeno (GIT_AGENT_PI_BIN=$PI_BIN) — spusť setup.sh"
+
+  local branch remote ahead
+  branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)
+  remote=$(git remote get-url "$(git remote | head -n1)" 2>/dev/null || echo '–')
+  ahead=$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 'n/a')
+
+  hdr "▶ pi přímý úkol: $repo (branch $branch)"
+  _PROMPT_TMP=$(mktemp)
+  {
+    cat <<EOF
+ROLE
+You are git-agent's on-demand subroutine running INSIDE the repository below.
+The user gave you a task — complete it autonomously (you have full tool access).
+
+REPOSITORY CONTEXT
+- path:    $repo (cwd: $PWD)
+- branch:  $branch
+- remote:  $remote
+- ahead:   $ahead (unpushed commits)
+- status:
+$(git status --porcelain=v1 | head -n 40)
+- log:     $(git log --oneline -5 2>/dev/null | tr '\n' ' ')
+
+HARD RULES
+1. Work ONLY inside this repository.
+2. NEVER solve anything by adding entries to .gitignore.
+3. Files larger than 100 MB must NOT be committed; leave them untracked.
+4. If you commit, message format: "\$(date '+%Y-%m-%d %H:%M:%S') ${COMMIT_TAG}-pi".
+5. If the task involves syncing with the remote, you are DONE only when
+   \`git rev-list --count @{upstream}..HEAD\` prints 0 and status is clean.
+EOF
+    printf '\nUSER TASK (highest priority)\n%s\n' "$task"
+  } > "$_PROMPT_TMP"
+
+  local rc=0
+  if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
+    info "DRY-RUN: $PI_BIN -p --no-session \"[git-agent] úloha…\""
+    cat "$_PROMPT_TMP"
+  else
+    timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session \
+      "[git-agent] úloha: ${task:0:120}" < "$_PROMPT_TMP"
+    rc=$?
+  fi
+  rm -f "$_PROMPT_TMP"
+
+  if (( rc == 0 )); then
+    ok "pi hotovo (rc=0) | ahead=$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo n/a)"
+    notify "git-agent: pi hotovo ✓" "${task:0:80}"
+  else
+    err "pi skončilo chybou (rc=$rc)"
+    notify "git-agent: pi chyba ✗" "${task:0:80}"
+  fi
+  return "$rc"
 }
 
 # ----------------------------------------------------------------- push ------
@@ -396,13 +467,14 @@ summary() {
 mode_local=1
 PI_CONTEXT=""
 lfs_file=""
+direct_pi=0
 
 while (($#)); do
   case "$1" in
     -g|--global)   mode_local=0 ;;
     -pi|--pi|-P)
-      [[ $# -ge 2 && -n ${2:-} ]] || die "$1 vyžaduje argument (kontext pro pi)"
-      PI_CONTEXT=$2; shift ;;
+      [[ $# -ge 2 && -n ${2:-} ]] || die "$1 vyžaduje argument (úkol pro pi)"
+      PI_CONTEXT=$2; direct_pi=1; shift ;;
     --add-lfs)
       [[ $# -ge 2 && -n ${2:-} ]] || die "$1 vyžaduje argument (cesta k souboru)"
       lfs_file=$2; shift ;;
@@ -420,6 +492,11 @@ hdr "══ $PROG v$VERSION ══"
 
 if [[ -n $lfs_file ]]; then
   do_add_lfs "$lfs_file"
+  exit $?
+fi
+
+if (( direct_pi )); then
+  run_pi_direct "$PI_CONTEXT"
   exit $?
 fi
 

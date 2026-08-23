@@ -39,6 +39,7 @@ if [[ ${PI_STUB_MODE:-fix} == fix ]]; then
   # POZOR: jen plným jménem (refs/remotes/…) — zkrácený tvar update-ref mlčky nezapíše
   up=$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
   [[ $up == refs/* ]] && git update-ref "$up" HEAD
+  exit 0
 else
   exit 1
 fi
@@ -67,7 +68,7 @@ exit 0
 EOF
 chmod +x "$STUB/pi" "$STUB/git-lfs" "$STUB/nh"
 
-export GIT_AGENT_NO_COLOR=1 GIT_AGENT_PI_BIN=pi
+export GIT_AGENT_NO_COLOR=1 GIT_AGENT_PI_BIN=pi GIT_AGENT_NO_LOCK=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export PATH="$STUB:$PATH"
 
@@ -190,7 +191,23 @@ unset GIT_NOTIFI
 [[ -s "$NH_LOG" ]] && { echo "-- obsah po zakázaném běhu:"; cat "$NH_LOG"; }
 chk "G: GIT_NOTIFI=0 → žádná notifikace"     test ! -s "$NH_LOG"
 
-# --------------------------------------------------------------- 7) CLI -------
+# --------------------------------------------------- 8) -pi přímé volání -----
+printf '\n== H: -pi spustí pi okamžitě s úkolem ==\n'
+H="$SB/h"; mkrepo "$H/repo"
+: > "$PI_CALL_LOG"; : > "$PI_PROMPT_LOG"
+out=$(cd "$H/repo" && bash "$AGENT" -pi "moje specialni zprava"); rc=$?
+saveout "$out" "$SB/h.out"
+chk     "H: exit kód 0"                    test "$rc" -eq 0
+chk     "H: pi zavoláno okamžitě (bez konfliktu!)" test -s "$PI_CALL_LOG"
+chk_out "H: prompt má uživatelovu zprávu"   "moje specialni zprava"        "$PI_PROMPT_LOG"
+chk_out "H: prompt má kontext repa"         "$H/repo|branch|ahead"        "$PI_PROMPT_LOG"
+chk_out "H: headline nese úkol"             "úloha.*moje specialni zprava" "$PI_CALL_LOG"
+bash "$AGENT" -pi >/dev/null 2>&1
+chk     "H: -pi bez argumentu → rc 2"       test "$?" -eq 2
+( cd /tmp && bash "$AGENT" -pi x ) >/dev/null 2>&1
+chk     "H: -pi mimo repo → rc 2"           test "$?" -eq 2
+
+# --------------------------------------------------------------- 9) CLI -------
 printf '\n== F: CLI ==\n'
 bash "$AGENT" --help > "$SB/help.out" 2>&1
 chk "F: --help zmiňuje --add-lfs"        grep -q -- "--add-lfs" "$SB/help.out"

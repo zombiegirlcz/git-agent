@@ -19,11 +19,20 @@ Po skončení spusť nový shell (aby se načetla PATH) nebo `source ~/.bashrc`.
 git-agent                  # lokálně: projde aktuální složku rekurzivně
 git-agent -g               # globálně: prohledá celý $HOME
 git-agent -g --global      # totéž
-git-agent -pi "kontext"    # doplňující pokyn pro pi při řešení konfliktů
+git-agent -pi "úkol"       # spustí PI HNED v aktuálním repozitři s tvým úkolem
+                           # (+ kontext repa); při konfliktu pushu ho dostane také
 git-agent --add-lfs f.bin  # zaradí soubor do Git LFS a commitne
 ```
 
 Vlajky lze kombinovat: `git-agent -g -pi "nedívej se do data/"`
+
+### Přímé volání pi (`-pi "úkol"`)
+
+`git-agent -pi "..."` nespouštá sken — **okamžitě předá slovo pi** v aktuálním
+repozitáři. Pi dostane plný kontext (cesta, branch, remote, ahead, status, log),
+tvůj úkol jako nejvyšší prioritu a pravidla agenta (žádné .gitignore řešení,
+limit 100 MB, formát commitů). Vhodné např. na `git-agent -pi "rebase na origin
+a pushni, nech main historii čistou"`.
 
 ## Co dělá v každém repozitáři
 
