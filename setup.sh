@@ -15,19 +15,17 @@ set -euo pipefail
 say() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[setup] CHYBA:\033[0m %s\n' "$*" >&2; exit 1; }
 
-SUDO=()
 if [[ $EUID -ne 0 ]]; then
   command -v sudo >/dev/null 2>&1 || die "spusť jako root, nebo nainstaluj sudo"
-  SUDO=(sudo)
 fi
 
-command -v curl >/dev/null 2>&1 || { $SUDO apt-get update -y && $SUDO apt-get install -y curl; }
+command -v curl >/dev/null 2>&1 || {  apt-get update -y &&  apt-get install -y curl; }
 
 # ---------------------------------------------------------------- 1) apt ----
 if command -v apt-get >/dev/null 2>&1; then
   say "apt-get: curl gh git git-lfs jq ca-certificates bash-completion util-linux …"
-  $SUDO apt-get update -y
-  $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y \
+   apt-get update -y
+   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl gh git git-lfs jq ca-certificates bash-completion util-linux
 else
   say "apt-get nenalezen (nejde o Debian/Ubuntu) — předpokládám ručně nainstalované nástroje."
