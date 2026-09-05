@@ -63,7 +63,7 @@ cat > "$STUB/copilot-leaky" <<'EOF'
 echo "CALL: $*" >> "$COPILOT_CALL_LOG"
 cat >> /dev/null
 if [[ ${STUB_LEAK:-0} == 1 ]]; then
-  ( sleep 97 ) &               # dítě ve STEJNÉ skupině jako copilot (jako qmd-server)
+  ( sleep 3 ) &                # dítě ve STEJNÉ skupině jako copilot (jako qmd-server)
 fi
 exit 0
 EOF
@@ -73,7 +73,7 @@ cat > "$STUB/nh" <<'EOF'
 #!/usr/bin/env bash
 if [[ ${1:-} == system && ${2:-} == notification ]]; then
   [[ -n ${NH_LOG:-} ]] || exit 0
-  echo "notification -t ${3:-} -c ${5:-}" >> "$NH_LOG"
+  echo "notification -t ${4:-} -c ${6:-}" >> "$NH_LOG"
 fi
 exit 0
 EOF
@@ -81,6 +81,8 @@ EOF
 chmod +x "$STUB/copilot" "$STUB/git-lfs" "$STUB/copilot-leaky" "$STUB/nh"
 
 export GIT_AGENT_NO_COLOR=1 GIT_AGENT_COPILOT_BIN=copilot GIT_AGENT_NO_LOCK=1 GIT_EXEC_PATH="$STUB"
+# globální gitconfig může mít filter.lfs z reálného git-lfs — v testech ho odstraníme
+git config --global --remove-section filter.lfs 2>/dev/null || true
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export PATH="$STUB:$PATH"
 
@@ -90,6 +92,7 @@ mkrepo() {
   git -C "$d" init -q -b main "$d" 2>/dev/null || git -C "$d" init -q "$d"
   git -C "$d" config user.email t@t
   git -C "$d" config user.name t
+  git -C "$d" config --local --remove-section filter.lfs 2>/dev/null || true
   echo seed > "$d/seed.txt"
   git -C "$d" add -A && git -C "$d" commit -qm seed
 }
@@ -205,7 +208,9 @@ chk     "G: notifikace odeslána"              grep -q 'notification -t' "$NH_LO
 chk_out "G: shrnutí v notifikaci"             "hotovo:.*commitů" "$NH_LOG"
 chk_out "G: titulek obsahuje git-agent"       "-t .*git-agent"   "$NH_LOG"
 : > "$NH_LOG"
-GIT_NOTIFI=0 out=$(run_agent "$G"); rc=$?
+export GIT_NOTIFI=0
+out=$(run_agent "$G"); rc=$?
+unset GIT_NOTIFI
 chk "G: GIT_NOTIFI=0 → žádná notifikace"     test ! -s "$NH_LOG"
 
 # ------------------------------------------------ 8) procesní hygiena --------
@@ -217,11 +222,11 @@ saveout "$out" "$SB/h.out"
 chk     "H: exit kód 0"                    test "$rc" -eq 0
 chk     "H: leaky-copilot zavoláno"        test -s "$COPILOT_CALL_LOG"
 gone=1
-for _ in 1 2 3 4 5 6; do
-  ps ax -o command 2>/dev/null | grep -qE 'sleep 97' || { gone=0; break; }
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  ps ax -o command 2>/dev/null | grep -qE 'sleep 3' || { gone=0; break; }
   sleep 0.5
 done
-chk "H: potomek copilot byl dočištěn (žádný sleep 97)" test "$gone" -eq 0
+chk "H: potomek copilot byl dočištěn (žádný sleep 3)" test "$gone" -eq 0
 
 # ------------------------------------------------ 9) zpráva commitu ---------
 printf '\n== I: generování zprávy commitu ==\n'
