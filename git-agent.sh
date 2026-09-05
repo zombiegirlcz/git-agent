@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
 #
 # git-agent — automatický commit & push všech nalezených git repozitářů.
-# Pri konfliktu na pushi deleguje opravu na pi (https://pi.dev) v neinteraktivním
-# režimu a následně OVĚŘÍ, že push skutečně prošel.
+# Na každém commitu vygeneruje zprávu přes GitHub Copilot CLI a při konfliktu
+# pushu mu předá opravu. V neinteraktivním režimu ověří, že push prošel.
 #
 # Použití:
 #   git-agent                  Lokální režim: projde aktuální složku (rekurzivně)
 #   git-agent -g | --global    Globální režim: prohledá celý $HOME
-#                              (kořen lze změnit: GIT_AGENT_GLOBAL_ROOT=/ git-agent -g)
-#   git-agent -pi "úkol"      Spustí PI OKAMŽITĚ v aktuálním repozitři — dostane
-#                             plný kontext repa + tvůj úkol (a při konfliktu
-#                             během automatického pushu ho dostane také)
-#   git-agent --add-lfs SOUBOR Přidá soubor do Git LFS ve svém repozáři a commitne
+#   git-agent --add-lfs SOUBOR Přidá soubor do Git LFS ve svém repozitři a commitne
+#   git-agent --no-commit-message|-im
+#                              Klasická zpráva "$(date) git-agent" místo AI
 #   git-agent -h | --help      Nápověda
 #   git-agent -V | --version   Verze
-#
-# Vlajky lze kombinovat, např.:  git-agent -g -pi "nedívej se do adresáře data/"
 #
 # Pravidla:
 #   * Binárky větší než 100 MB se NIKDY necommitují — vynechají se a vypíše se
@@ -23,13 +19,13 @@
 #     problém zápisem do .gitignore.
 #
 # Proměnné prostředí:
-#   GIT_AGENT_MAX_BYTES    limit velikosti souboru v bajtech (default: 104857600 = 100 MB)
-#   GIT_AGENT_PI_BIN       binárka pi (default: pi)
-#   GIT_AGENT_PI_TIMEOUT   timeout pro běh pi v sekundách (default: 1800)
-#   GIT_AGENT_GLOBAL_ROOT  kořen globálního hledání (default: $HOME)
-#   GIT_AGENT_LOG          soubor, kam se kompletní výstup přikládá (default: žádný)
-#   GIT_AGENT_NO_COLOR=1   vypne barvy
-#   GIT_AGENT_DRY_RUN=1    nic nemění, jen vypíše, co by udělal
+#   GIT_AGENT_MAX_BYTES        limit velikosti souboru v bajtech (default: 104857600 = 100 MB)
+#   GIT_AGENT_COPILOT_BIN      binárka Copilot CLI (default: copilot)
+#   GIT_AGENT_COPILOT_TIMEOUT  timeout pro copilot [s] (default: 60)
+#   GIT_AGENT_GLOBAL_ROOT      kořen globálního hledání (default: $HOME)
+#   GIT_AGENT_LOG              soubor, kam se kompletní výstup přikládá (default: žádný)
+#   GIT_AGENT_NO_COLOR=1       vypne barvy
+#   GIT_AGENT_DRY_RUN=1        nic nemění, jen vypíše, co by udělal
 #
 # Notifikace (Android/NetHunter):
 #   Průběh a výsledky chodí jako systémové notifikace přes `nh system
@@ -37,13 +33,13 @@
 
 set -uo pipefail
 
-VERSION="1.2.2"
+VERSION="1.3.0"
 PROG="git-agent"
 
 # ---------------------------------------------------------------- nastavení --
 MAX_BYTES="${GIT_AGENT_MAX_BYTES:-104857600}"          # 100 MB
-PI_BIN="${GIT_AGENT_PI_BIN:-pi}"
-PI_TIMEOUT="${GIT_AGENT_PI_TIMEOUT:-1800}"
+COPILOT_BIN="${GIT_AGENT_COPILOT_BIN:-copilot}"
+COPILOT_TIMEOUT="${GIT_AGENT_COPILOT_TIMEOUT:-60}"
 GLOBAL_ROOT="${GIT_AGENT_GLOBAL_ROOT:-$HOME}"
 COMMIT_TAG="git-agent"
 LOG_FILE="${GIT_AGENT_LOG:-}"
@@ -87,7 +83,6 @@ notify() {
 die()  { printf '%s%s: %s%s\n' "$C_RED" "$PROG" "$*" "$C_OFF" >&2; exit 2; }
 
 usage() {
-  # vytiskni celou úvodní komentářovou hlavičku (mezi shebang a prvním kódem)
   awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
 }
 
@@ -110,41 +105,40 @@ command -v find >/dev/null 2>&1 || die "find není nainstalovaný."
 command -v stat >/dev/null 2>&1 || die "stat není nainstalovaný."
 
 # ------------------------------------------------------------------ stavy ----
-SCANNED=0 DIRTY=0 COMMITTED=0 PUSHED=0 PI_CALLED=0
+SCANNED=0 DIRTY=0 COMMITTED=0 PUSHED=0 COPILOT_CALLED=0
 BIG_SKIPPED=() FAILED=()
 
 cleanup() { [[ -n ${_PROMPT_TMP:-} ]] && rm -f -- "$_PROMPT_TMP"; }
 
 # --- procesní hygiena -------------------------------------------------------
-# pi po skončení nechává žít děti (qmd-server, node workery…) → spouštíme ho
-# ve VLASTNÍ procesní skupině (setsid) a po běhu celou skupinu dočistíme.
-PI_PID=""
-stop_pi_group() {
-  [[ -n ${PI_PID:-} ]] || return 0
-  kill -TERM -- "-$PI_PID" 2>/dev/null || true
+# Copilot CLI (jako dříve pi) po skončení nechává žít děti (qmd-server,
+# node workery…) → spouštíme ho ve VLASTNÍ procesní skupině (setsid) a po
+# běhu celou skupinu dočistíme.
+AGENT_PID=""
+stop_agent_group() {
+  [[ -n ${AGENT_PID:-} ]] || return 0
+  kill -TERM -- "-$AGENT_PID" 2>/dev/null || true
   sleep "${GIT_AGENT_KILL_GRACE:-0.5}" 2>/dev/null || sleep 1
-  kill -KILL -- "-$PI_PID" 2>/dev/null || true
-  wait "$PI_PID" 2>/dev/null || true   # reap zombíků
-  PI_PID=""
+  kill -KILL -- "-$AGENT_PID" 2>/dev/null || true
+  wait "$AGENT_PID" 2>/dev/null || true   # reap zombíků
+  AGENT_PID=""
 }
-on_exit() { stop_pi_group; cleanup; }
+on_exit() { stop_agent_group; cleanup; }
 trap on_exit EXIT
 trap 'on_exit; exit 130' INT
 trap 'on_exit; exit 143' TERM
 
-# Spustí pi (headline=$1, prompt=$2); výsledný rc uloží do _PI_RC.
-# Subshell + exec setsid ⇒ PID subshellu se stane leaderem NOVÉ skupiny,
-# kterou umíme spolehlivě zabít (i co timeout nedostal).
-spawn_pi() {
+# Spustí Copilot (headline=$1, prompt=$2, [cwd=$3]); výsledný rc uloží do _AGENT_RC.
+spawn_agent() {
   local headline=$1 pfile=$2 cwd=${3:-} rc
   (
     if [[ -n $cwd ]]; then cd -- "$cwd" || exit 99; fi
-    exec setsid timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session "$headline" < "$pfile"
+    exec setsid timeout "$COPILOT_TIMEOUT" "$COPILOT_BIN" -p --allow-all-tools --no-ask-user --silent "$headline" < "$pfile"
   ) &
-  PI_PID=$!
-  wait "$PI_PID"; rc=$?
-  stop_pi_group
-  _PI_RC=$rc
+  AGENT_PID=$!
+  wait "$AGENT_PID"; rc=$?
+  stop_agent_group
+  _AGENT_RC=$rc
 }
 
 # --------------------------------------------------------------- hledání -----
@@ -156,15 +150,11 @@ find_repos() {
     if (( first )); then args+=(-type d -name "$p"); first=0
     else args+=(-o -type d -name "$p"); fi
   done
-  # (junk…) -prune -o ( -name .git -prune -print )
-  #   → junk se přeskočí bez tisku, .git se vytiskne a nevstupuje se do něj
   args+=(")" -prune "-o" "(" -name ".git" -prune "-print" ")")
   find "${args[@]}" 2>/dev/null | sort -u
 }
 
 # ------------------------------------------------------- velké binárky -------
-# Přidá všechny změny, ale soubory > MAX_BYTES okamžitě odstage (nikdy se
-# necommitují). Vrací 1 pokud add selhal úplně.
 stage_changes() {
   local repo=$1
   if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
@@ -177,7 +167,7 @@ stage_changes() {
   fi
   local f sz
   while IFS= read -r -d '' f; do
-    [[ -f "$repo/$f" ]] || continue           # smazané soubory přeskoč
+    [[ -f "$repo/$f" ]] || continue
     sz=$(stat -Lc %s "$repo/$f" 2>/dev/null) || continue
     if (( sz > MAX_BYTES )); then
       git -C "$repo" reset -q -- "$f"
@@ -189,11 +179,46 @@ stage_changes() {
   return 0
 }
 
-# ------------------------------------------------------------ pi oprava ------
-# Zavolá pi neinteraktivně s plným kontextem a poté ověří, že je vše pushnuté.
-pi_resolve_and_push() {
+# ------------------------------------------------------- commit zpráva -------
+# Vygeneruje zprávu pro commit přes Copilot CLI z diffu. Pokud copilot není
+# k dispozici nebo je vypnutý --no-commit-message, vrací klasickou zprávu.
+generate_commit_message() {
+  local repo=$1
+  local stat
+  stat=$(git -C "$repo" diff --cached --stat 2>/dev/null | head -n 40)
+  if [[ -z $stat ]]; then
+    printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+    return
+  fi
+  local prompt="Write a single-line conventional git commit message (max 72 chars) describing these changes. Output ONLY the message, no quotes, no markdown, no explanation: $(echo "$stat" | tr '\n' '; ' | sed 's/; */; /g')"
+  local pf; pf=$(mktemp)
+  printf '%s\n' "$prompt" > "$pf"
+  local outfile; outfile=$(mktemp)
+  ( cd -- "$repo" || exit 99; exec setsid timeout "$COPILOT_TIMEOUT" "$COPILOT_BIN" -p --allow-all-tools --no-ask-user --silent "$(cat "$pf")" ) > "$outfile" 2>/dev/null &
+  local pid=$!
+  wait "$pid" || true
+  kill -TERM -- "-$pid" 2>/dev/null || true
+  sleep "${GIT_AGENT_KILL_GRACE:-0.5}" 2>/dev/null || sleep 1
+  kill -KILL -- "-$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$pf"
+  local out msg
+  out=$(<"$outfile"); rm -f "$outfile"
+  msg=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*//; /^[[:space:]]*$/d; q;p')
+  msg=${msg#\`}; msg=${msg%\`}
+  msg=${msg#\"}; msg=${msg%\"}
+  if [[ -n $msg ]]; then
+    printf '%s\n' "$msg"
+  else
+    printf '%s\n' "$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+  fi
+}
+
+# -------------------------------------------------- copilot oprava pushu ------
+# Zavolá Copilot neinteraktivně s plným kontextem a poté ověří, že je vše pushnuté.
+copilot_resolve_and_push() {
   local repo=$1 branch=$2 remote=$3 push_err=$4
-  (( PI_CALLED++ ))
+  (( COPILOT_CALLED++ ))
   _PROMPT_TMP=$(mktemp)
   {
     cat <<EOF
@@ -226,30 +251,25 @@ HARD RULES
    untracked) AND \`git rev-list --count @{upstream}..HEAD\` prints 0
    (everything pushed). Verify this yourself with bash before finishing.
 EOF
-    if [[ -n ${PI_CONTEXT} ]]; then
-      printf '\nUSER-PROVIDED CONTEXT (higher priority than defaults)\n%s\n' "$PI_CONTEXT"
-    fi
   } > "$_PROMPT_TMP"
 
   local headline="[git-agent] Push selhal v $repo (branch $branch) — diagnostikuj, oprav, pushni."
   if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
-    info "DRY-RUN: $PI_BIN -p --no-session \"$headline\""
-    _PI_RC=0
+    info "DRY-RUN: $COPILOT_BIN -p --allow-all-tools --no-ask-user --silent \"$headline\""
+    _AGENT_RC=0
   else
-    spawn_pi "$headline" "$_PROMPT_TMP" "$repo"
-    rc=${_PI_RC:-0}
+    spawn_agent "$headline" "$_PROMPT_TMP" "$repo"
+    rc=${_AGENT_RC:-0}
   fi
 
   if (( rc != 0 )); then
-    err "pi skončilo s chybou (rc=$rc) — repo zůstává v konfliktu"
-    FAILED+=("$repo (pi rc=$rc)")
-    notify "git-agent: pi selhalo ✗" "$repo — pi skončilo chybou (rc=$rc), nutný ruční zásah"
+    err "copilot skončil s chybou (rc=$rc) — repo zůstává v konfliktu"
+    FAILED+=("$repo (copilot rc=$rc)")
+    notify "git-agent: copilot selhal ✗" "$repo — copilot skončil chybou (rc=$rc), nutný ruční zásah"
     return 1
   fi
 
-  # Ověření: opravdu je vše pushnuté a pracovní strom čistý?
   local up ahead
-  # plný refname (refs/remotes/…) — zkrácené tvary mohou být při resoluci nejednoznačné
   up=$(git -C "$repo" rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
   if [[ -n $up ]]; then
     ahead=$(git -C "$repo" rev-list --count "$up..HEAD" 2>/dev/null || echo 999)
@@ -257,87 +277,15 @@ EOF
     ahead=999
   fi
   if (( ahead == 0 )); then
-    ok "pi opravilo konflikt a push proběhl"
+    ok "copilot opravil konflikt a push proběhl"
     (( PUSHED++ ))
-    notify "git-agent: opraveno ✓" "$repo — pi vyřešilo konflikt a push proběhl"
+    notify "git-agent: opraveno ✓" "$repo — copilot vyřešil konflikt a push proběhl"
     return 0
   fi
-  err "pi nesplnilo cílový stav (ahead=$ahead) — vyžaduje ruční zásah"
-  FAILED+=("$repo (po pi: ahead=$ahead)")
-  notify "git-agent: nutný zásah ✗" "$repo — pi nesplnilo push (ahead=$ahead)"
+  err "copilot nesplnil cílový stav (ahead=$ahead) — vyžaduje ruční zásah"
+  FAILED+=("$repo (po copilot: ahead=$ahead)")
+  notify "git-agent: nutný zásah ✗" "$repo — copilot nesplnil push (ahead=$ahead)"
   return 1
-}
-
-# ------------------------------------------------------------- pi přímé -----
-# `git-agent -pi "úkol"` — spustí pi OKAMŽITĚ v aktuálním repozitři s plným
-# kontextem repa + uživatelovým zadáním (bez čekání na konflikt).
-run_pi_direct() {
-  local task=$1
-  [[ -n $task ]] || die "-pi vyžaduje úkol jako argument"
-  local repo
-  repo=$(git rev-parse --show-toplevel 2>/dev/null) \
-    || die "-pi: nejsi uvnitř git repozitáře ($PWD)"
-  command -v "$PI_BIN" >/dev/null 2>&1 \
-    || die "pi nenalezeno (GIT_AGENT_PI_BIN=$PI_BIN) — spusť setup.sh"
-
-  local branch remote ahead
-  branch=$(git symbolic-ref --short -q HEAD 2>/dev/null || echo DETACHED)
-  remote=$(git remote get-url "$(git remote | head -n1)" 2>/dev/null || echo '–')
-  ahead=$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo 'n/a')
-
-  hdr "▶ pi přímý úkol: $repo (branch $branch)"
-  _PROMPT_TMP=$(mktemp)
-  {
-    cat <<EOF
-ROLE
-You are git-agent's on-demand subroutine running INSIDE the repository below.
-The user gave you a task — complete it autonomously (you have full tool access).
-
-REPOSITORY CONTEXT
-- path:    $repo (cwd: $PWD)
-- branch:  $branch
-- remote:  $remote
-- ahead:   $ahead (unpushed commits)
-- status:
-$(git status --porcelain=v1 | head -n 40)
-- log:     $(git log --oneline -5 2>/dev/null | tr '\n' ' ')
-
-HARD RULES
-1. Work ONLY inside this repository.
-2. NEVER solve anything by adding entries to .gitignore.
-3. Files larger than 100 MB must NOT be committed; leave them untracked.
-4. If you commit, message format: "\$(date '+%Y-%m-%d %H:%M:%S') ${COMMIT_TAG}-pi".
-5. If the task involves syncing with the remote, you are DONE only when
-   \`git rev-list --count @{upstream}..HEAD\` prints 0 and status is clean.
-EOF
-    printf '\nUSER TASK (highest priority)\n%s\n' "$task"
-  } > "$_PROMPT_TMP"
-
-  local rc=0
-  if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
-    info "DRY-RUN: $PI_BIN -p --no-session \"[git-agent] úloha…\""
-    cat "$_PROMPT_TMP"
-    _PI_RC=0
-  else
-    # pi potřebuje cwd = repozitář → cd uvnitř spawn wrapperu
-    (
-      exec setsid timeout "$PI_TIMEOUT" "$PI_BIN" -p --no-session \
-        "[git-agent] úloha: ${task:0:120}" < "$_PROMPT_TMP"
-    ) &
-    PI_PID=$!
-    wait "$PI_PID"; rc=$?
-    stop_pi_group
-  fi
-  rm -f "$_PROMPT_TMP"
-
-  if (( rc == 0 )); then
-    ok "pi hotovo (rc=0) | ahead=$(git rev-list --count '@{upstream}..HEAD' 2>/dev/null || echo n/a)"
-    notify "git-agent: pi hotovo ✓" "${task:0:80}"
-  else
-    err "pi skončilo chybou (rc=$rc)"
-    notify "git-agent: pi chyba ✗" "${task:0:80}"
-  fi
-  return "$rc"
 }
 
 # ----------------------------------------------------------------- push ------
@@ -358,7 +306,6 @@ push_if_needed() {
   if [[ -n $upstream ]]; then
     ahead=$(git -C "$repo" rev-list --count "$upstream..HEAD" 2>/dev/null || echo 0)
   else
-    # Bez upstreamu tiskneme jen když právě vznikl nový commit (nejmenší surprise).
     if (( committed )); then
       push_args=(-u "$remote" "$branch"); ahead=1
     else
@@ -381,10 +328,10 @@ push_if_needed() {
     return 0
   fi
 
-  warn "push zamítnut / konflikt — předávám pi…"
+  warn "push zamítnut / konflikt — předávám copilot…"
   printf '%s\n' "$out" | sed 's/^/    /' >&2
-  notify "git-agent: konflikt ⚠" "push zamítnut v $repo (branch $branch) — řeší pi"
-  pi_resolve_and_push "$repo" "$branch" "$remote" "$out"
+  notify "git-agent: konflikt ⚠" "push zamítnut v $repo (branch $branch) — řeší copilot"
+  copilot_resolve_and_push "$repo" "$branch" "$remote" "$out"
 }
 
 # ------------------------------------------------------------ repozitář ------
@@ -404,7 +351,6 @@ process_repo() {
     return 0
   fi
 
-  # 1) nezapomenuté lokální změny → add + commit
   local dirty committed=0
   dirty=$(git -C "$repo" status --porcelain=v1)
   if [[ -n $dirty ]]; then
@@ -412,7 +358,13 @@ process_repo() {
     stage_changes "$repo" || { FAILED+=("$repo (git add)"); return 1; }
     if ! git -C "$repo" diff --cached --quiet 2>/dev/null; then
       local msg
-      msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+      if [[ -n ${GIT_AGENT_NO_COMMIT_MESSAGE:-} ]]; then
+        msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+      elif command -v "$COPILOT_BIN" >/dev/null 2>&1; then
+        msg=$(generate_commit_message "$repo")
+      else
+        msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+      fi
       if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
         info "DRY-RUN: git commit -m \"$msg\""
         committed=1
@@ -429,7 +381,6 @@ process_repo() {
     fi
   fi
 
-  # 2) nepushnuté commity → push (konflikt řeší pi)
   push_if_needed "$repo" "$branch" "$committed"
 }
 
@@ -475,8 +426,8 @@ do_add_lfs() {
 # ---------------------------------------------------------------- shrnutí ----
 summary() {
   hdr "══ Shrnutí ══"
-  printf '  repozitářů: %d | se změnami: %d | commitů: %d | pushů: %d | volání pi: %d\n' \
-    "$SCANNED" "$DIRTY" "$COMMITTED" "$PUSHED" "$PI_CALLED"
+  printf '  repozitářů: %d | se změnami: %d | commitů: %d | pushů: %d | volání copilot: %d\n' \
+    "$SCANNED" "$DIRTY" "$COMMITTED" "$PUSHED" "$COPILOT_CALLED"
   local x
   for x in "${BIG_SKIPPED[@]:-}"; do
     [[ -n $x ]] && warn "necommitnuto (>100 MB): $x"
@@ -490,7 +441,7 @@ summary() {
     notify "git-agent ✓" "hotovo: $SCANNED repozitářů, $COMMITTED commitů, $PUSHED pushů"
   else
     err "celkem selhání: $fails"
-    notify "git-agent: selhání ($fails) ✗" "repo:$SCANNED commit:$COMMITTED push:$PUSHED pi:$PI_CALLED — zkontroluj log"
+    notify "git-agent: selhání ($fails) ✗" "repo:$SCANNED commit:$COMMITTED push:$PUSHED copilot:$COPILOT_CALLED — zkontroluj log"
   fi
   (( fails > 125 )) && fails=125
   return "$fails"
@@ -498,16 +449,14 @@ summary() {
 
 # ------------------------------------------------------------------ main -----
 mode_local=1
-PI_CONTEXT=""
+no_commit_message=0
 lfs_file=""
-direct_pi=0
 
 while (($#)); do
   case "$1" in
     -g|--global)   mode_local=0 ;;
-    -pi|--pi|-P)
-      [[ $# -ge 2 && -n ${2:-} ]] || die "$1 vyžaduje argument (úkol pro pi)"
-      PI_CONTEXT=$2; direct_pi=1; shift ;;
+    --no-commit-message|-im)
+      no_commit_message=1 ;;
     --add-lfs)
       [[ $# -ge 2 && -n ${2:-} ]] || die "$1 vyžaduje argument (cesta k souboru)"
       lfs_file=$2; shift ;;
@@ -528,11 +477,6 @@ if [[ -n $lfs_file ]]; then
   exit $?
 fi
 
-if (( direct_pi )); then
-  run_pi_direct "$PI_CONTEXT"
-  exit $?
-fi
-
 local_root=$PWD
 root=$local_root
 (( mode_local )) || root=$GLOBAL_ROOT
@@ -544,7 +488,6 @@ else
   printf '%s\n' "${C_DIM}režim: globální ($root)${C_OFF}"
 fi
 
-# nalezení a deduplikace repozitářů (worktree ukazují na stejný toplevel)
 declare -A SEEN=()
 gitpaths=()
 while IFS= read -r gp; do
@@ -566,4 +509,4 @@ for gp in "${gitpaths[@]}"; do
 done
 
 summary
-exit $?   # exit kód = počet selhavších repozitářů (max 125)
+exit $?

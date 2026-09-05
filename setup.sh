@@ -55,6 +55,14 @@ nvm install node
 nvm alias default node >/dev/null
 say "Node.js: $(node -v) | npm: $(npm -v)"
 
+# 3b) GitHub Copilot CLI
+if ! command -v copilot >/dev/null 2>&1; then
+  say "instaluji GitHub Copilot CLI (@github/copilot)…"
+  npm install -g @github/copilot
+else
+  say "Copilot CLI již je: $(copilot --version 2>/dev/null || echo '?')"
+fi
+
 # --------------------------------------------------------------- 4) pi ------
 if ! command -v pi >/dev/null 2>&1; then
   say "instaluji pi …"
