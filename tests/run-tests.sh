@@ -68,7 +68,17 @@ fi
 exit 0
 EOF
 
-chmod +x "$STUB/copilot" "$STUB/git-lfs" "$STUB/copilot-leaky"
+# stub nh — notifikace jen zaznamenává (a nikdy nesmí spadnout, když log není nastaven)
+cat > "$STUB/nh" <<'EOF'
+#!/usr/bin/env bash
+if [[ ${1:-} == system && ${2:-} == notification ]]; then
+  [[ -n ${NH_LOG:-} ]] || exit 0
+  echo "notification -t ${3:-} -c ${5:-}" >> "$NH_LOG"
+fi
+exit 0
+EOF
+
+chmod +x "$STUB/copilot" "$STUB/git-lfs" "$STUB/copilot-leaky" "$STUB/nh"
 
 export GIT_AGENT_NO_COLOR=1 GIT_AGENT_COPILOT_BIN=copilot GIT_AGENT_NO_LOCK=1
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
