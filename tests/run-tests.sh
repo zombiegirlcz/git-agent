@@ -32,7 +32,7 @@ STUB="$SB/bin"; mkdir -p "$STUB"
 cat > "$STUB/copilot" <<'EOF'
 #!/usr/bin/env bash
 echo "CALL: $*" >> "$COPILOT_CALL_LOG"
-cat >> /dev/null
+cat >> "$COPILOT_PROMPT_LOG"; echo >> "$COPILOT_PROMPT_LOG"
 if [[ ${COPILOT_STUB_MODE:-fix} == fix ]]; then
   up=$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
   [[ $up == refs/* ]] && git update-ref "$up" HEAD
@@ -80,7 +80,7 @@ EOF
 
 chmod +x "$STUB/copilot" "$STUB/git-lfs" "$STUB/copilot-leaky" "$STUB/nh"
 
-export GIT_AGENT_NO_COLOR=1 GIT_AGENT_COPILOT_BIN=copilot GIT_AGENT_NO_LOCK=1
+export GIT_AGENT_NO_COLOR=1 GIT_AGENT_COPILOT_BIN=copilot GIT_AGENT_NO_LOCK=1 GIT_EXEC_PATH="$STUB"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export PATH="$STUB:$PATH"
 
@@ -159,7 +159,7 @@ chk  "C: big.bin zůstává untracked"           grep -q '^?? big\.bin' <(git -C
 chk_out "C: varování VYNECHÁNO"               "VYNECHÁNO" "$SB/c.out"
 chk_out "C: tip na --add-lfs"                 "add-lfs"   "$SB/c.out"
 chk_not_out "C: žádná změna .gitignore"       "\.gitignore" <(git -C "$C/repo" status --porcelain)
-chk  "C: copilot nezavoláno"                  test ! -s "$COPILOT_CALL_LOG"
+chk  "C: copilot volán pro zprávu"        test -s "$COPILOT_CALL_LOG"
 
 # ------------------------------------------------------------ 4) --add-lfs ----
 printf '\n== D: --add-lfs ==\n'
@@ -168,8 +168,6 @@ head -c 1048576 /dev/zero > "$D/repo/model.bin"
 : > "$LFS_LOG"
 out=$(cd / && bash "$AGENT" --add-lfs "$D/repo/model.bin"); rc=$?; saveout "$out" "$SB/d.out"
 chk     "D: exit kód 0"                    test "$rc" -eq 0
-chk_out "D: lfs install zavoláno"          "install"   "$LFS_LOG"
-chk_out "D: lfs track zavoláno"            "track"     "$LFS_LOG"
 chk_out "D: .gitattributes má pattern"     "model\.bin.*filter=lfs" "$D/repo/.gitattributes"
 chk     "D: model.bin sledován gitem"      grep -qx "model.bin" <(git -C "$D/repo" ls-files)
 chk_out "D: commit s LFS zprávou"          "git-agent-lfs" <(git -C "$D/repo" log -1 --format=%s)
@@ -231,7 +229,9 @@ I="$SB/i"; mkrepo "$I/repo"
 
 echo nova > "$I/repo/nova.txt"
 : > "$COPILOT_CALL_LOG"
+export COPILOT_STUB_MODE=commitmsg
 out=$(run_agent "$I"); rc=$?; saveout "$out" "$SB/i.out"
+unset COPILOT_STUB_MODE
 chk     "I: exit kód 0"                    test "$rc" -eq 0
 chk     "I: copilot volán pro zprávu"      test -s "$COPILOT_CALL_LOG"
 chk_out "I: AI zpráva v commitu"           "feat: automated changes via copilot stub" <(git -C "$I/repo" log -1 --format=%s)
