@@ -204,7 +204,7 @@ generate_commit_message() {
   rm -f "$pf"
   local out msg
   out=$(<"$outfile"); rm -f "$outfile"
-  msg=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*//; /^[[:space:]]*$/d; q;p')
+  msg=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*//; /^[[:space:]]*$/d; p')
   msg=${msg#\`}; msg=${msg%\`}
   msg=${msg#\"}; msg=${msg%\"}
   if [[ -n $msg ]]; then

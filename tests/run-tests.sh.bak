@@ -53,7 +53,10 @@ case $cmd in
   version) echo "git-lfs/3.7.0 (stub)" ;;
   install) exit 0 ;;
   track)   printf '"%s" filter=lfs diff=lfs merge=lfs -text\n' "$*" >> .gitattributes ;;
-  filter-process) cat > /dev/null; printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n' "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 1234 ;;
+  filter-process)
+    read -r line || true
+    cat > /dev/null
+    printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n' "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 1234 ;;
   *)       exit 0 ;;
 esac
 EOF
@@ -174,7 +177,6 @@ out=$(cd / && bash "$AGENT" --add-lfs "$D/repo/model.bin"); rc=$?; saveout "$out
 chk     "D: exit kód 0"                    test "$rc" -eq 0
 chk_out "D: .gitattributes má pattern"     "model\.bin.*filter=lfs" "$D/repo/.gitattributes"
 chk     "D: model.bin sledován gitem"      grep -qx "model.bin" <(git -C "$D/repo" ls-files)
-exit 0
 chk_out "D: commit s LFS zprávou"          "git-agent-lfs" <(git -C "$D/repo" log -1 --format=%s)
 
 # --------------------------------------------------------- 5) copilot selže -----
