@@ -17,22 +17,47 @@ Po skončení spusť nový shell (aby se načetla PATH) nebo `source ~/.bashrc`.
 ```bash
 git-agent                  # lokálně: projde aktuální složku rekurzivně
 git-agent -g               # globálně: prohledá celý $HOME
-git-agent -g --global      # totéž
 git-agent --add-lfs f.bin  # zaradí soubor do Git LFS a commitne
 git-agent --no-commit-message|-im
                            # použije klasickou "$(date) git-agent" zprávu místo AI
+
+# synchronizace (fetch + pull + push):
+git-agent pull             # fetch + pull (git default strategie)
+git-agent pull --rebase    # fetch + pull --rebase
+git-agent pull --merge     # fetch + pull (vynucený merge)
+git-agent -g pull          # globálně přes všechny repozitáře
 ```
+
+## Pull / synchronizace
+
+`git-agent pull` v každém repozitáři:
+
+1. commitne lokální změny (AI zprávou jako obvykle),
+2. `git fetch --prune`,
+3. podle režimu: `pull` (default) / `pull --rebase` / `pull --merge` / `--reset`,
+4. pushne, co vzniklo navíc (merge commity, lokální commity).
+
+Konflikty při pullu i pushi předá **copilotovi** (`copilot -p --allow-all-tools
+--no-ask-user --silent`) s plným kontextem a ověří, že stav je čistý a `ahead=0`.
+
+Režim `--reset` provede `git fetch` + `git reset --hard <remote>/<branch>` —
+**zahodí lokální změny i commity** (proto se musí psát explicitně jako
+`git-agent pull --reset`; samotné `--reset` skončí chybou).
+
+Pobočka bez upstreamu: pull se provede explicitně proti `origin/<branch>` a
+nastaví se tracking.
 
 ## Co dělá v každém repozitáři
 
-1. **Špinavý pracovní strom** → `git add -A` (s filtrhem >100 MB) + commit
+1. **Špinavý pracovní strom** → `git add -A` (s filtrem >100 MB) + commit
 2. **Zpráva commitu**: defaultně ji vygeneruje **Copilot CLI** z diffu; přepínač
-   `--no-commit-message` / `-im` vráti klasickou `$(date) git-agent`.
+   `--no-commit-message` / `-im` vrátí klasickou `$(date) git-agent`.
 3. **Nepushnuté commity** → `git push`; když je zamítnut (konflikt,
    non-fast-forward…), zavolá `copilot -p --allow-all-tools --no-ask-user
    --silent` s plným kontextem (cesta, branch, remote, status, přesné znění
    chyby) a poté **ověří**, že push skutečně prošel.
-4. Na konci vytiskne shrnutí; exit kód = počet selhavších repozitářů (max 125).
+4. Na konci vytiskne shrnutí (`repozitářů / se změnami / commitů / pullů / pushů /
+   volání copilot`); exit kód = počet selhavších repozitářů (max 125).
 
 Repozitáře bez remotes se jen commitnou lokálně. Bare repozitáře a detached
 HEAD se bezpečně přeskočí. Proti dvojímu běhu chrání flock.
@@ -88,5 +113,5 @@ tests/run-tests.sh    # offline; používá stub copilot a stub git-lfs
 ```
 git-agent.sh        # samotný agent (instaluje se jako ~/.local/bin/git-agent)
 setup.sh            # idempotentní instalace závislostí + agenta
-tests/run-tests.sh  # end-to-end testy (čisté repo, konflikt→copilot, 100MB limit, LFS, CLI)
+tests/run-tests.sh  # end-to-end testy (čisté repo, konflikt→copilot, 100MB limit, LFS, pull, CLI)
 ```

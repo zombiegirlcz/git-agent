@@ -8,6 +8,12 @@
 #   git-agent                  Lokální režim: projde aktuální složku (rekurzivně)
 #   git-agent -g | --global    Globální režim: prohledá celý $HOME
 #   git-agent --add-lfs SOUBOR Přidá soubor do Git LFS ve svém repozitři a commitne
+#   git-agent pull             Fetch + pull ve všech nalezených repozitářích (sync)
+#   git-agent pull --rebase    totéž rebase strategií (konflikty řeší copilot)
+#   git-agent pull --merge     totéž merge strategií
+#   git-agent pull --reset     git fetch + git reset --hard <remote>/<branch>
+#                              POZOR: zahodí lokální změny i commity
+#   git-agent -g pull …        totéž globálně (celý $HOME)
 #   git-agent --no-commit-message|-im
 #                              Klasická zpráva "$(date) git-agent" místo AI
 #   git-agent -h | --help      Nápověda
@@ -33,7 +39,7 @@
 
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 PROG="git-agent"
 
 # ---------------------------------------------------------------- nastavení --
@@ -105,7 +111,7 @@ command -v find >/dev/null 2>&1 || die "find není nainstalovaný."
 command -v stat >/dev/null 2>&1 || die "stat není nainstalovaný."
 
 # ------------------------------------------------------------------ stavy ----
-SCANNED=0 DIRTY=0 COMMITTED=0 PUSHED=0 COPILOT_CALLED=0
+SCANNED=0 DIRTY=0 COMMITTED=0 PUSHED=0 COPILOT_CALLED=0 PULLED=0
 BIG_SKIPPED=() FAILED=()
 
 cleanup() { [[ -n ${_PROMPT_TMP:-} ]] && rm -f -- "$_PROMPT_TMP"; }
@@ -128,12 +134,20 @@ trap on_exit EXIT
 trap 'on_exit; exit 130' INT
 trap 'on_exit; exit 143' TERM
 
-# Spustí Copilot (headline=$1, prompt=$2, [cwd=$3]); výsledný rc uloží do _AGENT_RC.
+# Spustí Copilot (headline=$1, prompt=$2, [cwd=$3], [stdout=$4]); rc uloží do _AGENT_RC.
+# Pozn.: stdin se explicitně přesměrovává do souboru (pfile), aby se stub/reálný
+# nástroj nikdy nezablokoval na terminálu.
 spawn_agent() {
-  local headline=$1 pfile=$2 cwd=${3:-} rc
+  local headline=$1 pfile=$2 cwd=${3:-} out=${4:-} rc
   (
     if [[ -n $cwd ]]; then cd -- "$cwd" || exit 99; fi
-    exec setsid timeout "$COPILOT_TIMEOUT" "$COPILOT_BIN" -p --allow-all-tools --no-ask-user --silent "$headline" < "$pfile"
+    if [[ -n $out ]]; then
+      exec setsid timeout "$COPILOT_TIMEOUT" "$COPILOT_BIN" -p "$headline" --allow-all-tools --no-ask-user --silent \
+        < "$pfile" > "$out" 2>/dev/null
+    else
+      exec setsid timeout "$COPILOT_TIMEOUT" "$COPILOT_BIN" -p "$headline" --allow-all-tools --no-ask-user --silent \
+        < "$pfile"
+    fi
   ) &
   AGENT_PID=$!
   wait "$AGENT_PID"; rc=$?
@@ -191,20 +205,13 @@ generate_commit_message() {
     return
   fi
   local prompt="Write a single-line conventional git commit message (max 72 chars) describing these changes. Output ONLY the message, no quotes, no markdown, no explanation: $(echo "$stat" | tr '\n' '; ' | sed 's/; */; /g')"
-  local pf; pf=$(mktemp)
-  printf '%s\n' "$prompt" > "$pf"
   local outfile; outfile=$(mktemp)
-  ( cd -- "$repo" || exit 99; exec setsid timeout "$COPILOT_TIMEOUT" "$COPILOT_BIN" -p --allow-all-tools --no-ask-user --silent "$(cat "$pf")" ) > "$outfile" 2>/dev/null &
-  local pid=$!
-  wait "$pid" || true
-  kill -TERM -- "-$pid" 2>/dev/null || true
-  sleep "${GIT_AGENT_KILL_GRACE:-0.5}" 2>/dev/null || sleep 1
-  kill -KILL -- "-$pid" 2>/dev/null || true
-  wait "$pid" 2>/dev/null || true
-  rm -f "$pf"
+  # prompt jde argumentem, stdin zavřený → stub/reálný copilot se nemůže zablokovat
+  spawn_agent "$prompt" /dev/null "$repo" "$outfile"
   local out msg
   out=$(<"$outfile"); rm -f "$outfile"
-  msg=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*//; /^[[:space:]]*$/d; p')
+  # vezmi první neprázdný řádek odpovědi a zbav ho obalových uvozovek/backticků
+  msg=$(printf '%s\n' "$out" | sed -n 's/^[[:space:]]*//; /^[[:space:]]*$/d; p; q')
   msg=${msg#\`}; msg=${msg%\`}
   msg=${msg#\"}; msg=${msg%\"}
   if [[ -n $msg ]]; then
@@ -255,7 +262,7 @@ EOF
 
   local headline="[git-agent] Push selhal v $repo (branch $branch) — diagnostikuj, oprav, pushni."
   if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
-    info "DRY-RUN: $COPILOT_BIN -p --allow-all-tools --no-ask-user --silent \"$headline\""
+    info "DRY-RUN: $COPILOT_BIN -p \"$headline\" --allow-all-tools --no-ask-user --silent"
     _AGENT_RC=0
   else
     spawn_agent "$headline" "$_PROMPT_TMP" "$repo"
@@ -335,6 +342,41 @@ push_if_needed() {
 }
 
 # ------------------------------------------------------------ repozitář ------
+# Commitne lokální změny (pokud jsou). Nastaví _COMMITTED=1/0; vrací 1 při chybě.
+commit_if_dirty() {
+  local repo=$1
+  _COMMITTED=0
+  local dirty
+  dirty=$(git -C "$repo" status --porcelain=v1)
+  [[ -n $dirty ]] || return 0
+  (( DIRTY++ ))
+  stage_changes "$repo" || { FAILED+=("$repo (git add)"); return 1; }
+  if ! git -C "$repo" diff --cached --quiet 2>/dev/null; then
+    local msg
+    if [[ -n ${GIT_AGENT_NO_COMMIT_MESSAGE:-} ]]; then
+      msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+    elif command -v "$COPILOT_BIN" >/dev/null 2>&1; then
+      msg=$(generate_commit_message "$repo")
+    else
+      msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
+    fi
+    if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
+      info "DRY-RUN: git commit -m \"$msg\""
+      _COMMITTED=1
+    elif git -C "$repo" commit -q -m "$msg"; then
+      ok "commit: $msg"
+      (( COMMITTED++ )); _COMMITTED=1
+    else
+      err "git commit selhal"
+      FAILED+=("$repo (git commit)")
+      return 1
+    fi
+  else
+    info "změny pokryly jen vynechané soubory (>limit) — nic k commitu"
+  fi
+  return 0
+}
+
 process_repo() {
   local repo=$1
   (( SCANNED++ ))
@@ -351,37 +393,109 @@ process_repo() {
     return 0
   fi
 
-  local dirty committed=0
-  dirty=$(git -C "$repo" status --porcelain=v1)
-  if [[ -n $dirty ]]; then
-    (( DIRTY++ ))
-    stage_changes "$repo" || { FAILED+=("$repo (git add)"); return 1; }
-    if ! git -C "$repo" diff --cached --quiet 2>/dev/null; then
-      local msg
-      if [[ -n ${GIT_AGENT_NO_COMMIT_MESSAGE:-} ]]; then
-        msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
-      elif command -v "$COPILOT_BIN" >/dev/null 2>&1; then
-        msg=$(generate_commit_message "$repo")
-      else
-        msg="$(date '+%Y-%m-%d %H:%M:%S') $COMMIT_TAG"
-      fi
-      if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
-        info "DRY-RUN: git commit -m \"$msg\""
-        committed=1
-      elif git -C "$repo" commit -q -m "$msg"; then
-        ok "commit: $msg"
-        (( COMMITTED++ )); committed=1
-      else
-        err "git commit selhal"
-        FAILED+=("$repo (git commit)")
-        return 1
-      fi
-    else
-      info "změny pokryly jen vynechané soubory (>limit) — nic k commitu"
-    fi
+  commit_if_dirty "$repo" || return 1
+  push_if_needed "$repo" "$branch" "${_COMMITTED:-0}"
+}
+
+# ------------------------------------------------------------------ pull -----
+# Synchronizace s remote: commit lokálních změn → fetch → pull/reset → push.
+# Konflikty při pullu i pushi řeší copilot.
+pull_repo() {
+  local repo=$1
+  (( SCANNED++ ))
+  hdr "▶ $repo (pull: $PULL_MODE)"
+
+  local inside
+  inside=$(git -C "$repo" rev-parse --is-inside-work-tree 2>/dev/null || echo false)
+  [[ $inside == true ]] || { info "bare/plain adresář — přeskočeno"; return 0; }
+
+  local branch
+  branch=$(git -C "$repo" symbolic-ref --short -q HEAD || true)
+  if [[ -z $branch ]]; then
+    warn "detached HEAD — přeskočeno (vyžaduje ruční rozhodnutí)"
+    return 0
   fi
 
-  push_if_needed "$repo" "$branch" "$committed"
+  # 1) lokální změny — v reset režimu se zahazují, jinde se nejdřív commitnou
+  _COMMITTED=0
+  if [[ $PULL_MODE == reset ]]; then
+    [[ -n $(git -C "$repo" status --porcelain=v1) ]] && \
+      warn "reset režim — necommitnuté lokální změny budou zahozeny"
+  else
+    commit_if_dirty "$repo" || return 1
+  fi
+
+  local remote
+  remote=$(git -C "$repo" remote | head -n 1 || true)
+  if [[ -z $remote ]]; then
+    info "žádný remote — pull přeskočen"
+    return 0
+  fi
+
+  if [[ -n ${GIT_AGENT_DRY_RUN:-} ]]; then
+    info "DRY-RUN: git fetch --prune $remote + pull ($PULL_MODE)"
+    return 0
+  fi
+
+  # 2) fetch
+  local out
+  if ! out=$(git -C "$repo" fetch --prune "$remote" 2>&1); then
+    warn "fetch selhal — předávám copilot…"
+    printf '%s\n' "$out" | sed 's/^/    /' >&2
+    notify "git-agent: fetch selhal ⚠" "$repo — řeší copilot"
+    copilot_resolve_and_push "$repo" "$branch" "$remote" "$out"
+    return $?
+  fi
+
+  local -a cmd=(pull)
+  case $PULL_MODE in
+    rebase) cmd=(-c pull.rebase=true pull) ;;
+    merge)  cmd=(-c pull.rebase=false pull) ;;
+  esac
+
+  # 3) synchronizace
+  if [[ $PULL_MODE == reset ]]; then
+    local target="$remote/$branch"
+    if ! git -C "$repo" rev-parse --verify -q "$target" >/dev/null; then
+      warn "větev $target na remote neexistuje — reset přeskočen"
+      return 0
+    fi
+    warn "reset --hard na $target (zahazuje lokální stav)"
+    if ! out=$(git -C "$repo" reset --hard "$target" 2>&1); then
+      err "reset selhal: $out"
+      FAILED+=("$repo (reset --hard)")
+      return 1
+    fi
+    ok "reset --hard $target"
+    notify "git-agent: reset --hard ⚠" "$repo → $target"
+    (( PULLED++ ))
+  else
+    local upstream
+    upstream=$(git -C "$repo" rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+    local -a pull_cmd=("${cmd[@]}")
+    if [[ -n $upstream ]]; then
+      :
+    elif git -C "$repo" rev-parse --verify -q "$remote/$branch" >/dev/null; then
+      pull_cmd+=("$remote" "$branch")   # pobočka bez upstreamu — explicitně
+    else
+      info "větev nemá upstream a na remote není — pull vynechán"
+      return 0
+    fi
+
+    if ! out=$(git -C "$repo" "${pull_cmd[@]}" 2>&1); then
+      warn "pull selhal / konflikt — předávám copilot…"
+      printf '%s\n' "$out" | sed 's/^/    /' >&2
+      notify "git-agent: konflikt při pull ⚠" "$repo (branch $branch)"
+      copilot_resolve_and_push "$repo" "$branch" "$remote" "$out"
+      return $?
+    fi
+    ok "pull ($PULL_MODE) → $remote/$branch"
+    [[ -n $upstream ]] || git -C "$repo" branch --set-upstream-to="$remote/$branch" >/dev/null 2>&1 || true
+    (( PULLED++ ))
+  fi
+
+  # 4) co vzniklo navíc (merge/lokální commity), dohnat na remote
+  push_if_needed "$repo" "$branch" "${_COMMITTED:-0}"
 }
 
 # -------------------------------------------------------------- --add-lfs ----
@@ -426,8 +540,8 @@ do_add_lfs() {
 # ---------------------------------------------------------------- shrnutí ----
 summary() {
   hdr "══ Shrnutí ══"
-  printf '  repozitářů: %d | se změnami: %d | commitů: %d | pushů: %d | volání copilot: %d\n' \
-    "$SCANNED" "$DIRTY" "$COMMITTED" "$PUSHED" "$COPILOT_CALLED"
+  printf '  repozitářů: %d | se změnami: %d | commitů: %d | pullů: %d | pushů: %d | volání copilot: %d\n' \
+    "$SCANNED" "$DIRTY" "$COMMITTED" "$PULLED" "$PUSHED" "$COPILOT_CALLED"
   local x
   for x in "${BIG_SKIPPED[@]:-}"; do
     [[ -n $x ]] && warn "necommitnuto (>100 MB): $x"
@@ -438,10 +552,10 @@ summary() {
   done
   if (( fails == 0 )); then
     ok "vše hotovo"
-    notify "git-agent ✓" "hotovo: $SCANNED repozitářů, $COMMITTED commitů, $PUSHED pushů"
+    notify "git-agent ✓" "hotovo: $SCANNED repozitářů, $COMMITTED commitů, $PULLED pullů, $PUSHED pushů"
   else
     err "celkem selhání: $fails"
-    notify "git-agent: selhání ($fails) ✗" "repo:$SCANNED commit:$COMMITTED push:$PUSHED copilot:$COPILOT_CALLED — zkontroluj log"
+    notify "git-agent: selhání ($fails) ✗" "repo:$SCANNED commit:$COMMITTED pull:$PULLED push:$PUSHED copilot:$COPILOT_CALLED — zkontroluj log"
   fi
   (( fails > 125 )) && fails=125
   return "$fails"
@@ -451,10 +565,16 @@ summary() {
 mode_local=1
 no_commit_message=0
 lfs_file=""
+ACTION=scan
+PULL_MODE=auto
 
 while (($#)); do
   case "$1" in
     -g|--global)   mode_local=0 ;;
+    pull|--pull)   ACTION=pull ;;
+    --rebase)      PULL_MODE=rebase ;;
+    --merge)       PULL_MODE=merge ;;
+    --reset)       PULL_MODE=reset ;;
     --no-commit-message|-im)
       no_commit_message=1 ;;
     --add-lfs)
@@ -469,6 +589,14 @@ while (($#)); do
   esac
   shift
 done
+
+# --rebase/--merge samy implikují pull; --reset je destruktivní → chce 'pull'
+if [[ $PULL_MODE != auto && $ACTION != pull ]]; then
+  if [[ $PULL_MODE == reset ]]; then
+    die "--reset je destruktivní — použij explicitně: $PROG pull --reset"
+  fi
+  ACTION=pull
+fi
 
 hdr "══ $PROG v$VERSION ══"
 
@@ -505,7 +633,11 @@ for gp in "${gitpaths[@]}"; do
   key=$(readlink -f -- "$top" 2>/dev/null || printf '%s' "$top")
   [[ -n ${SEEN[$key]+x} ]] && continue
   SEEN["$key"]=1
-  process_repo "$top" || true
+  if [[ $ACTION == pull ]]; then
+    pull_repo "$top" || true
+  else
+    process_repo "$top" || true
+  fi
 done
 
 summary

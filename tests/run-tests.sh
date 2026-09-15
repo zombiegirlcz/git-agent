@@ -34,6 +34,9 @@ cat > "$STUB/copilot" <<'EOF'
 echo "CALL: $*" >> "$COPILOT_CALL_LOG"
 cat >> "$COPILOT_PROMPT_LOG"; echo >> "$COPILOT_PROMPT_LOG"
 if [[ ${COPILOT_STUB_MODE:-fix} == fix ]]; then
+  # simuluj opravu konfliktu: dokonči rebase/merge, pak srovnej tracking ref
+  git rebase --abort 2>/dev/null || true
+  git merge --abort 2>/dev/null || true
   up=$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
   [[ $up == refs/* ]] && git update-ref "$up" HEAD
 elif [[ ${COPILOT_STUB_MODE:-commitmsg} == commitmsg ]]; then
@@ -53,7 +56,9 @@ case $cmd in
   version) echo "git-lfs/3.7.0 (stub)" ;;
   install) exit 0 ;;
   track)   printf '"%s" filter=lfs diff=lfs merge=lfs -text\n' "$*" >> .gitattributes ;;
-  filter-process) cat > /dev/null; printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize %d\n' "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef" 1234 ;;
+  # POZOR: nikdy nečíst stdin — git čeká na pkt-line odpověď, čtení by se zaseklo
+  # (testy mají izolovaný git config, takže se sem ani nedostane)
+  filter-process) exit 0 ;;
   *)       exit 0 ;;
 esac
 EOF
@@ -66,6 +71,9 @@ cat >> /dev/null
 if [[ ${STUB_LEAK:-0} == 1 ]]; then
   ( sleep 3 ) &                # dítě ve STEJNÉ skupině jako copilot (jako qmd-server)
 fi
+# simuluj úspěšnou opravu (aby verifikace ahead==0 prošla)
+up=$(git rev-parse --symbolic-full-name '@{upstream}' 2>/dev/null || true)
+[[ $up == refs/* ]] && git update-ref "$up" HEAD
 exit 0
 EOF
 
@@ -82,8 +90,12 @@ EOF
 chmod +x "$STUB/copilot" "$STUB/git-lfs" "$STUB/copilot-leaky" "$STUB/nh"
 
 export GIT_AGENT_NO_COLOR=1 GIT_AGENT_COPILOT_BIN=copilot GIT_AGENT_NO_LOCK=1
-# globální gitconfig může mít filter.lfs z reálného git-lfs — v testech ho odstraníme
-git config --global --remove-section filter.lfs 2>/dev/null || true
+# Izolace od systémového/uživatelského git configu (jinak /etc/gitconfig pouští
+# reálný filter.lfs→stub git-lfs a git čeká na pkt-line odpověď = deadlock).
+# Zároveň tím NEMODIFIKUJEME uživatelův ~/.gitconfig.
+export GIT_CONFIG_NOSYSTEM=1
+export GIT_CONFIG_GLOBAL="$SB/gitconfig-global"
+: > "$GIT_CONFIG_GLOBAL"
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export PATH="$STUB:$PATH"
 
@@ -113,7 +125,27 @@ make_rejected() {
 }
 
 run_agent() { ( cd "$1" && bash "$AGENT" ) 2>&1; }
+run_agent_args() { local d=$1; shift; ( cd "$d" && bash "$AGENT" "$@" ) 2>&1; }
 saveout()   { printf '%s\n' "$1" > "$2"; }
+
+# Fixture pro pull testy: ne-bare origin repo + klon work.
+# Push URL je záměrně neexistující → push vždy deterministicky selže
+# (fetch/pull funguje, protože čte z lokální cesty).
+make_pull_fixture() {
+  local base=$1 name=$2
+  mkrepo "$base/$name-origin"
+  git clone -q "$base/$name-origin" "$base/$name-work"
+  git -C "$base/$name-work" config user.email t@t
+  git -C "$base/$name-work" config user.name t
+  git -C "$base/$name-work" remote set-url --push origin "/nonexistent-git-agent-pull.git"
+}
+
+remote_commit() {
+  local origin=$1 file=$2 content=$3
+  printf '%s\n' "$content" > "$origin/$file"
+  git -C "$origin" add -A
+  git -C "$origin" commit -qm "remote: $file"
+}
 
 # ------------------------------------------------------------------ 0) lint --
 printf '\n== lint ==\n'
@@ -145,6 +177,7 @@ chk     "B: exit kód 0"                       test "$rc" -eq 0
 chk     "B: copilot zavoláno"                 test -s "$COPILOT_CALL_LOG"
 chk_out "B: prompt obsahuje cestu repa"       "b/work"                "$COPILOT_PROMPT_LOG"
 chk_out "B: prompt obsahuje chybu push"       "fatal:|rejected|behind|not appear" "$COPILOT_PROMPT_LOG"
+chk_out "B: správné pořadí argumentů copilotu" "CALL: -p \\[git-agent\\] Push selhal.*--allow-all-tools --no-ask-user --silent" "$COPILOT_CALL_LOG"
 chk     "B: po copilot je ahead=0"            test "$(git -C "$B/work" rev-list --count '@{upstream}..HEAD')" -eq 0
 chk     "B: pracovní strom je čistý"          test -z "$(git -C "$B/work" status --porcelain)"
 chk_not_out "B: žádné SELHALO v shrnutí"      "SELHALO"               "$SB/b.out"
@@ -174,7 +207,6 @@ out=$(cd / && bash "$AGENT" --add-lfs "$D/repo/model.bin"); rc=$?; saveout "$out
 chk     "D: exit kód 0"                    test "$rc" -eq 0
 chk_out "D: .gitattributes má pattern"     "model\.bin.*filter=lfs" "$D/repo/.gitattributes"
 chk     "D: model.bin sledován gitem"      grep -qx "model.bin" <(git -C "$D/repo" ls-files)
-exit 0
 chk_out "D: commit s LFS zprávou"          "git-agent-lfs" <(git -C "$D/repo" log -1 --format=%s)
 
 # --------------------------------------------------------- 5) copilot selže -----
@@ -193,6 +225,11 @@ chk "F: --help zmiňuje copilot"          grep -qi -- "copilot" "$SB/help.out"
 chk "F: --help zmiňuje --add-lfs"        grep -q -- "--add-lfs" "$SB/help.out"
 chk "F: --help zmiňuje --no-commit-message" grep -qiE "no-commit-message|\-im" "$SB/help.out"
 chk "F: --help zmiňuje -g/--global"      grep -qiE '\-\-global|\-g\b' "$SB/help.out"
+chk "F: --help zmiňuje pull"             grep -q -- "git-agent pull" "$SB/help.out"
+chk "F: --help zmiňuje --reset"          grep -q -- "--reset" "$SB/help.out"
+mkdir -p "$SB/f-empty"
+( cd "$SB/f-empty" && bash "$AGENT" --reset ) >/dev/null 2>&1
+chk "F: --reset bez 'pull' → rc 2"       test "$?" -eq 2
 bash "$AGENT" --version > "$SB/ver.out" 2>&1
 chk "F: --version"                       grep -q "git-agent" "$SB/ver.out"
 bash "$AGENT" --rozhodne-neexistujici-flag >/dev/null 2>&1
@@ -241,6 +278,7 @@ out=$(run_agent "$I"); rc=$?; saveout "$out" "$SB/i.out"
 unset COPILOT_STUB_MODE
 chk     "I: exit kód 0"                    test "$rc" -eq 0
 chk     "I: copilot volán pro zprávu"      test -s "$COPILOT_CALL_LOG"
+chk_out "I: prompt je hodnotou -p"         "CALL: -p Write a single-line.*--allow-all-tools --no-ask-user --silent" "$COPILOT_CALL_LOG"
 chk_out "I: AI zpráva v commitu"           "feat: automated changes via copilot stub" <(git -C "$I/repo" log -1 --format=%s)
 
 echo dalsi > "$I/repo/dalsi.txt"
@@ -249,6 +287,66 @@ out=$(GIT_AGENT_NO_COMMIT_MESSAGE=1 run_agent "$I"); rc=$?
 chk     "I: no-commit exit 0"              test "$rc" -eq 0
 chk     "I: classic zpráva"                git -C "$I/repo" log -1 --format=%s | grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} git-agent$'
 chk     "I: copilot nezavolán"             test ! -s "$COPILOT_CALL_LOG"
+
+# ------------------------------------------------------------ 10) pull ------
+printf '\n== J: pull (fetch + pull) ==\n'
+J="$SB/j"
+
+# J1: --rebase, fast-forward
+J1="$J/j1"; make_pull_fixture "$J1" ff
+remote_commit "$J1/ff-origin" remote.txt "from remote"
+out=$(run_agent_args "$J1/ff-work" pull --rebase); rc=$?; saveout "$out" "$SB/j1.out"
+chk     "J1: exit kód 0"             test "$rc" -eq 0
+chk     "J1: fast-forward proběhl"   test -f "$J1/ff-work/remote.txt"
+chk_out "J1: hlášení pull"           "pull \(rebase\)" "$SB/j1.out"
+chk     "J1: ahead=0"                test "$(git -C "$J1/ff-work" rev-list --count '@{upstream}..HEAD')" -eq 0
+
+# J2: --merge — lokální změna (agent ji commitne) + remote commit → merge, push selže → copilot
+J2="$J/j2"; make_pull_fixture "$J2" mg
+echo local > "$J2/mg-work/local.txt"
+remote_commit "$J2/mg-origin" remote2.txt "r2"
+: > "$COPILOT_CALL_LOG"
+out=$(run_agent_args "$J2/mg-work" pull --merge); rc=$?; saveout "$out" "$SB/j2.out"
+chk "J2: exit kód 0"              test "$rc" -eq 0
+chk "J2: lokální soubor zůstal"   test -f "$J2/mg-work/local.txt"
+chk "J2: remote soubor přišel"    test -f "$J2/mg-work/remote2.txt"
+chk "J2: merge commit vznikl"     test "$(git -C "$J2/mg-work" rev-list --count --merges HEAD)" -ge 1
+chk "J2: push selhal → copilot"   test -s "$COPILOT_CALL_LOG"
+chk "J2: po copilot ahead=0"      test "$(git -C "$J2/mg-work" rev-list --count '@{upstream}..HEAD')" -eq 0
+
+# J3: --reset — zahodí lokální commit i soubory
+J3="$J/j3"; make_pull_fixture "$J3" rs
+echo local > "$J3/rs-work/local.txt"
+git -C "$J3/rs-work" add -A && git -C "$J3/rs-work" commit -qm "local work"
+remote_commit "$J3/rs-origin" remote3.txt "r3"
+out=$(run_agent_args "$J3/rs-work" pull --reset); rc=$?; saveout "$out" "$SB/j3.out"
+chk "J3: exit kód 0"             test "$rc" -eq 0
+chk "J3: HEAD == origin HEAD"    test "$(git -C "$J3/rs-work" rev-parse HEAD)" = "$(git -C "$J3/rs-origin" rev-parse HEAD)"
+chk "J3: lokální soubor zahozen" test ! -f "$J3/rs-work/local.txt"
+chk "J3: remote soubor přítomen" test -f "$J3/rs-work/remote3.txt"
+
+# J4: konflikt při pull --rebase → copilot
+J4="$J/j4"; make_pull_fixture "$J4" cf
+printf 'local\n' > "$J4/cf-work/c.txt"
+git -C "$J4/cf-work" add -A && git -C "$J4/cf-work" commit -qm "local c"
+remote_commit "$J4/cf-origin" c.txt "remote"
+: > "$COPILOT_CALL_LOG"; : > "$COPILOT_PROMPT_LOG"
+out=$(run_agent_args "$J4/cf-work" pull --rebase); rc=$?; saveout "$out" "$SB/j4.out"
+chk     "J4: exit kód 0"                test "$rc" -eq 0
+chk     "J4: copilot zavolán"           test -s "$COPILOT_CALL_LOG"
+chk_out "J4: prompt obsahuje konflikt"  "conflict" "$COPILOT_PROMPT_LOG"
+chk     "J4: repo není uprostřed rebase" test ! -d "$J4/cf-work/.git/rebase-merge" -a ! -d "$J4/cf-work/.git/rebase-apply"
+chk     "J4: ahead=0"                   test "$(git -C "$J4/cf-work" rev-list --count '@{upstream}..HEAD')" -eq 0
+
+# J5: -g pull globálně přes GIT_AGENT_GLOBAL_ROOT
+J5="$J/j5"; make_pull_fixture "$J5" g1; make_pull_fixture "$J5" g2
+remote_commit "$J5/g1-origin" g1.txt x
+remote_commit "$J5/g2-origin" g2.txt y
+out=$(cd /tmp && GIT_AGENT_GLOBAL_ROOT="$J5" bash "$AGENT" -g pull); rc=$?; saveout "$out" "$SB/j5.out"
+chk     "J5: exit kód 0"        test "$rc" -eq 0
+chk     "J5: repo1 pullnuto"    test -f "$J5/g1-work/g1.txt"
+chk     "J5: repo2 pullnuto"    test -f "$J5/g2-work/g2.txt"
+chk_out "J5: pullů v souhrnu"  "pullů:\s*2" "$SB/j5.out"
 
 # ------------------------------------------------------------------ konec -----
 printf '\n════════════════════════════\n'

@@ -6,7 +6,7 @@
 # Instaluje:
 #   1) systémové balíčky: curl gh git git-lfs jq ca-certificates
 #   2) nvm (v0.40.1) + aktuální Node.js
-#   3) pi (https://pi.dev)  — AI agent pro řešení konfliktů
+#   3) GitHub Copilot CLI (@github/copilot) — generuje zprávy commitů a řeší konflikty
 #   4) git-lfs hooky pro uživatele (git lfs install)
 #   5) samotný git-agent → ~/.local/bin/git-agent (+ PATH v .bashrc/.zshrc)
 
@@ -15,17 +15,20 @@ set -euo pipefail
 say() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
 die() { printf '\033[1;31m[setup] CHYBA:\033[0m %s\n' "$*" >&2; exit 1; }
 
+SUDO=()
 if [[ $EUID -ne 0 ]]; then
   command -v sudo >/dev/null 2>&1 || die "spusť jako root, nebo nainstaluj sudo"
+  SUDO=(sudo)
 fi
+sudo_maybe() { if ((${#SUDO[@]})); then "${SUDO[@]}" "$@"; else "$@"; fi; }
 
-command -v curl >/dev/null 2>&1 || {  apt-get update -y &&  apt-get install -y curl; }
+command -v curl >/dev/null 2>&1 || { sudo_maybe apt-get update -y && sudo_maybe apt-get install -y curl; }
 
 # ---------------------------------------------------------------- 1) apt ----
 if command -v apt-get >/dev/null 2>&1; then
   say "apt-get: curl gh git git-lfs jq ca-certificates bash-completion util-linux …"
-   apt-get update -y
-   DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  sudo_maybe apt-get update -y
+  DEBIAN_FRONTEND=noninteractive sudo_maybe apt-get install -y \
     curl gh git git-lfs jq ca-certificates bash-completion util-linux
 else
   say "apt-get nenalezen (nejde o Debian/Ubuntu) — předpokládám ručně nainstalované nástroje."
@@ -63,14 +66,6 @@ else
   say "Copilot CLI již je: $(copilot --version 2>/dev/null || echo '?')"
 fi
 
-# --------------------------------------------------------------- 4) pi ------
-if ! command -v pi >/dev/null 2>&1; then
-  say "instaluji pi …"
-  curl -fsSL https://pi.dev/install.sh | bash
-else
-  say "pi již je instalované: $(command -v pi)"
-fi
-
 # ------------------------------------------------------- 5) git-agent -------
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd -P)
 [[ -f "$SCRIPT_DIR/git-agent.sh" ]] || die "vedle setup.sh chybí git-agent.sh"
@@ -101,4 +96,5 @@ fi
 
 say "Hotovo ✅  Zkus:  git-agent --help   |   git-agent          (lokálně)"
 say "                git-agent -g         (globálně celý \$HOME)"
+say "                git-agent pull       (fetch + pull, konflikty řeší copilot)"
 say "                git-agent --add-lfs velky-soubor.bin"
