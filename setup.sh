@@ -135,6 +135,18 @@ if (( CRON_INSTALL )); then
   rm -f "$_ctmp"
   say "crontab: $("${CT[@]}" -l 2>/dev/null | grep 'git-agent-cron' | tail -n 1)"
 
+  # když vixie crontab není, vytvoř tenký shim, aby fungovalo 'crontab -l/-e'
+  if ! command -v crontab >/dev/null 2>&1 && command -v busybox >/dev/null 2>&1; then
+    _shim=$(mktemp)
+    printf '#!/bin/sh\nexec busybox crontab -c %s "$@"\n' "$CRON_SPOOL" > "$_shim"
+    if sudo_maybe install -m 0755 "$_shim" /usr/local/bin/crontab 2>/dev/null; then
+      say "vytvořen shim /usr/local/bin/crontab → busybox"
+    else
+      say "POZOR: crontab shim nevznikl — používej 'busybox crontab -c $CRON_SPOOL'"
+    fi
+    rm -f "$_shim"
+  fi
+
   # daemon: service → cron → busybox crond (v prootu init neběží)
   if ! cron_running; then
     sudo_maybe service cron start >/dev/null 2>&1 \
@@ -153,15 +165,19 @@ if (( CRON_INSTALL )); then
   ensure_cron_line() {
     local rc=$1
     [[ -f $rc ]] || : > "$rc"
-    grep -qs 'git-agent: cron autostart' "$rc" && return 0
+    grep -qs 'git-agent: cron autostart' "$rc" && return 1
     {
       printf '\n# git-agent: cron autostart (proot/kontejner nemá init)\n'
       printf 'if command -v busybox >/dev/null 2>&1; then pgrep -f "busybox crond" >/dev/null 2>&1 || busybox crond -b -l 8 -c %s 2>/dev/null; fi\n' "$CRON_SPOOL"
     } >> "$rc"
+    return 0
   }
-  ensure_cron_line "$HOME/.bashrc"
-  [[ -f "$HOME/.zshrc" ]] && ensure_cron_line "$HOME/.zshrc"
-  say "autostart cronu přidán do ~/.bashrc (spustí se při přihlášení)"
+  if ensure_cron_line "$HOME/.bashrc"; then
+    say "autostart cronu přidán do ~/.bashrc (spustí se při přihlášení)"
+  else
+    say "autostart cronu už v ~/.bashrc je ✓"
+  fi
+  [[ -f "$HOME/.zshrc" ]] && ensure_cron_line "$HOME/.zshrc" || true
 fi
 
 # ------------------------------------------------------------ 7) tipy -------
