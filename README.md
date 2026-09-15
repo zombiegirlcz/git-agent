@@ -8,6 +8,7 @@ Copilot CLI** a při konfliktu na pushu mu předá opravu.
 
 ```bash
 ./setup.sh          # curl, gh, git, git-lfs, jq, nvm+node, copilot, ~/.local/bin/git-agent
+./setup.sh --cron   # totéž + hodinový cron job (git-agent -g)
 ```
 
 Po skončení spusť nový shell (aby se načetla PATH) nebo `source ~/.bashrc`.
@@ -83,6 +84,34 @@ Po stage se agent automaticky zeptá **GitHub Copilot CLI** na shrnutí změn
 a použije ho jako zprávu commitu. Pro klasickou zprávu `$(date) git-agent`
 přidej `--no-commit-message` (nebo zkráceně `-im`).
 
+## Pravidelný běh (cron)
+
+```bash
+./setup.sh --cron        # nainstaluje cron job: 0 * * * * git-agent-cron
+crontab -l               # kontrola
+crontab -e               # úprava / smazání řádku = vypnutí
+```
+
+Wrapper `~/.local/bin/git-agent-cron` se stará o to, co cron neumí:
+
+- nastaví `PATH` (včetně node/nvm, aby fungoval `copilot`),
+- loguje do `~/.local/state/git-agent/cron.log` (rotace při 5 MB),
+- limit běhu `GIT_AGENT_CRON_TIMEOUT` (default 3600 s),
+- argumenty přes `GIT_AGENT_CRON_ARGS` (default `-g` = globální commit+push),
+- notifikace `GIT_AGENT_CRON_NOTIFY`:
+  - `changes` (default) — notifikace jen když se něco commitlo/pullnulo/pushlo nebo selhalo,
+  - `always` — notifikuje při každém běhu,
+  - `never` — nikdy.
+
+Ruční test wrapperu (nic nemění):
+
+```bash
+GIT_AGENT_DRY_RUN=1 GIT_AGENT_CRON_NOTIFY=never ~/.local/bin/git-agent-cron
+```
+
+> V prootu/kontejneru cron po restartu neběží sám — nastartuj ho
+> `sudo service cron start` (nebo přidej do startup skriptu).
+
 ## Notifikace
 
 Agent posílá systémové notifikace přes NetHunter CLI (`nh system notification -t … -c …`) —
@@ -112,6 +141,7 @@ tests/run-tests.sh    # offline; používá stub copilot a stub git-lfs
 
 ```
 git-agent.sh        # samotný agent (instaluje se jako ~/.local/bin/git-agent)
-setup.sh            # idempotentní instalace závislostí + agenta
+git-agent-cron.sh   # cron wrapper (instaluje se jako ~/.local/bin/git-agent-cron)
+setup.sh            # idempotentní instalace závislostí + agenta (+ --cron)
 tests/run-tests.sh  # end-to-end testy (čisté repo, konflikt→copilot, 100MB limit, LFS, pull, CLI)
 ```
